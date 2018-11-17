@@ -70,43 +70,44 @@ const (
 // ConfigLocal implements the Config interface using purely local
 // server objects (no KBFS operations used RPCs).
 type ConfigLocal struct {
-	lock             sync.RWMutex
-	kbfs             KBFSOps
-	keyman           KeyManager
-	rep              Reporter
-	kcache           KeyCache
-	kbcache          kbfsmd.KeyBundleCache
-	bcache           BlockCache
-	dirtyBcache      DirtyBlockCache
-	diskBlockCache   DiskBlockCache
-	diskMDCache      DiskMDCache
-	codec            kbfscodec.Codec
-	mdops            MDOps
-	kops             KeyOps
-	crypto           Crypto
-	chat             Chat
-	mdcache          MDCache
-	bops             BlockOps
-	mdserv           MDServer
-	bserv            BlockServer
-	keyserv          KeyServer
-	service          KeybaseService
-	bsplit           BlockSplitter
-	notifier         Notifier
-	clock            Clock
-	kbpki            KBPKI
-	renamer          ConflictRenamer
-	userHistory      *kbfsedits.UserHistory
-	registry         metrics.Registry
-	loggerFn         func(prefix string) logger.Logger
-	noBGFlush        bool // logic opposite so the default value is the common setting
-	rwpWaitTime      time.Duration
-	diskLimiter      DiskLimiter
-	syncedTlfs       map[tlf.ID]bool
-	defaultBlockType keybase1.BlockType
-	kbfsService      *KBFSService
-	kbCtx            Context
-	rootNodeWrappers []func(Node) Node
+	lock                   sync.RWMutex
+	kbfs                   KBFSOps
+	keyman                 KeyManager
+	rep                    Reporter
+	kcache                 KeyCache
+	kbcache                kbfsmd.KeyBundleCache
+	bcache                 BlockCache
+	dirtyBcache            DirtyBlockCache
+	diskBlockCache         DiskBlockCache
+	diskMDCache            DiskMDCache
+	diskBlockMetadataStore DiskBlockMetadataStore
+	codec                  kbfscodec.Codec
+	mdops                  MDOps
+	kops                   KeyOps
+	crypto                 Crypto
+	chat                   Chat
+	mdcache                MDCache
+	bops                   BlockOps
+	mdserv                 MDServer
+	bserv                  BlockServer
+	keyserv                KeyServer
+	service                KeybaseService
+	bsplit                 BlockSplitter
+	notifier               Notifier
+	clock                  Clock
+	kbpki                  KBPKI
+	renamer                ConflictRenamer
+	userHistory            *kbfsedits.UserHistory
+	registry               metrics.Registry
+	loggerFn               func(prefix string) logger.Logger
+	noBGFlush              bool // logic opposite so the default value is the common setting
+	rwpWaitTime            time.Duration
+	diskLimiter            DiskLimiter
+	syncedTlfs             map[tlf.ID]bool
+	defaultBlockType       keybase1.BlockType
+	kbfsService            *KBFSService
+	kbCtx                  Context
+	rootNodeWrappers       []func(Node) Node
 
 	maxNameBytes           uint32
 	rekeyQueue             RekeyQueue
@@ -612,6 +613,13 @@ func (c *ConfigLocal) DiskMDCache() DiskMDCache {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 	return c.diskMDCache
+}
+
+// DiskBlockMetadataStore implements the Config interface for ConfigLocal.
+func (c *ConfigLocal) DiskBlockMetadataStore() DiskBlockMetadataStore {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.diskBlockMetadataStore
 }
 
 // DiskLimiter implements the Config interface for ConfigLocal.
@@ -1225,6 +1233,10 @@ func (c *ConfigLocal) Shutdown(ctx context.Context) error {
 	if dmc != nil {
 		dmc.Shutdown(ctx)
 	}
+	bms := c.DiskBlockMetadataStore()
+	if bms != nil {
+		bms.Shutdown()
+	}
 	kbfsServ := c.kbfsService
 	if kbfsServ != nil {
 		kbfsServ.Shutdown()
@@ -1436,6 +1448,23 @@ func (c *ConfigLocal) MakeDiskMDCacheIfNotExists() error {
 		return nil
 	}
 	return c.resetDiskMDCacheLocked()
+}
+
+// MakeDiskBlockMetadataStoreIfNotExists implements the Config interface for
+// ConfigLocal. If error happens, a Noop one is populated.
+func (c *ConfigLocal) MakeDiskBlockMetadataStoreIfNotExists() error {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if c.diskBlockMetadataStore != nil {
+		return nil
+	}
+	bms, err := newDiskBlockMetadataStore(c)
+	if err != nil {
+		bms = NoopBlockMetadataStore{}
+		return err
+	}
+	c.diskBlockMetadataStore = bms
+	return nil
 }
 
 func (c *ConfigLocal) openConfigLevelDB(configName string) (*levelDb, error) {
