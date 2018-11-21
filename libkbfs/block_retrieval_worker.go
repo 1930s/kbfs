@@ -77,7 +77,13 @@ func (brw *blockRetrievalWorker) HandleRequest() (err error) {
 		block = retrieval.requests[0].block.NewEmpty()
 	}()
 
-	return brw.getBlock(retrieval.ctx, retrieval.kmd, retrieval.blockPtr, block)
+	cacheType := DiskBlockAnyCache
+	if retrieval.action == blockRequestWithSync {
+		cacheType = DiskBlockSyncCache
+	}
+
+	return brw.getBlock(
+		retrieval.ctx, retrieval.kmd, retrieval.blockPtr, block, cacheType)
 }
 
 // Shutdown shuts down the blockRetrievalWorker once its current work is done.
