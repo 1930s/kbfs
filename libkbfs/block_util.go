@@ -24,12 +24,14 @@ func isRecoverableBlockError(err error) bool {
 
 // putBlockToServer either puts the full block to the block server, or
 // just adds a reference, depending on the refnonce in blockPtr.
-func putBlockToServer(ctx context.Context, bserv BlockServer, tlfID tlf.ID,
-	blockPtr BlockPointer, readyBlockData ReadyBlockData) error {
+func putBlockToServer(
+	ctx context.Context, bserv BlockServer, tlfID tlf.ID,
+	blockPtr BlockPointer, readyBlockData ReadyBlockData,
+	cacheType DiskBlockCacheType) error {
 	var err error
 	if blockPtr.RefNonce == kbfsblock.ZeroRefNonce {
 		err = bserv.Put(ctx, tlfID, blockPtr.ID, blockPtr.Context,
-			readyBlockData.buf, readyBlockData.serverHalf)
+			readyBlockData.buf, readyBlockData.serverHalf, cacheType)
 	} else {
 		// non-zero block refnonce means this is a new reference to an
 		// existing block.
@@ -44,8 +46,10 @@ func putBlockToServer(ctx context.Context, bserv BlockServer, tlfID tlf.ID,
 // quota and disk limit errors.
 func PutBlockCheckLimitErrs(ctx context.Context, bserv BlockServer,
 	reporter Reporter, tlfID tlf.ID, blockPtr BlockPointer,
-	readyBlockData ReadyBlockData, tlfName tlf.CanonicalName) error {
-	err := putBlockToServer(ctx, bserv, tlfID, blockPtr, readyBlockData)
+	readyBlockData ReadyBlockData, tlfName tlf.CanonicalName,
+	cacheType DiskBlockCacheType) error {
+	err := putBlockToServer(
+		ctx, bserv, tlfID, blockPtr, readyBlockData, cacheType)
 	switch typedErr := errors.Cause(err).(type) {
 	case kbfsblock.ServerErrorOverQuota:
 		if !typedErr.Throttled {
@@ -70,17 +74,25 @@ func PutBlockCheckLimitErrs(ctx context.Context, bserv BlockServer,
 }
 
 func doOneBlockPut(ctx context.Context, bserv BlockServer, reporter Reporter,
-	tlfID tlf.ID, tlfName tlf.CanonicalName, blockState blockState,
-	blocksToRemoveChan chan *FileBlock) error {
-	err := PutBlockCheckLimitErrs(ctx, bserv, reporter, tlfID, blockState.blockPtr,
-		blockState.readyBlockData, tlfName)
-	if err == nil && blockState.syncedCb != nil {
-		err = blockState.syncedCb()
+	tlfID tlf.ID, tlfName tlf.CanonicalName, ptr BlockPointer,
+	bps blockPutState, blocksToRemoveChan chan BlockPointer,
+	cacheType DiskBlockCacheType) error {
+	readyBlockData, err := bps.getReadyBlockData(ctx, ptr)
+	if err != nil {
+		return err
+	}
+	err = PutBlockCheckLimitErrs(
+		ctx, bserv, reporter, tlfID, ptr, readyBlockData, tlfName, cacheType)
+	if err == nil {
+		err = bps.synced(ptr)
 	}
 	if err != nil && isRecoverableBlockError(err) {
-		fblock, ok := blockState.block.(*FileBlock)
-		if ok && !fblock.IsInd {
-			blocksToRemoveChan <- fblock
+		block, blockErr := bps.getBlock(ctx, ptr)
+		if blockErr == nil {
+			fblock, ok := block.(*FileBlock)
+			if ok && !fblock.IsInd {
+				blocksToRemoveChan <- ptr
+			}
 		}
 	}
 
@@ -95,9 +107,10 @@ func doOneBlockPut(ctx context.Context, bserv BlockServer, reporter Reporter,
 // Returns a slice of block pointers that resulted in recoverable
 // errors and should be removed by the caller from any saved state.
 func doBlockPuts(ctx context.Context, bserv BlockServer, bcache BlockCache,
-	reporter Reporter, log, deferLog traceLogger, tlfID tlf.ID, tlfName tlf.CanonicalName,
-	bps blockPutState) (blocksToRemove []BlockPointer, err error) {
-	blockCount := len(bps.blockStates)
+	reporter Reporter, log, deferLog traceLogger, tlfID tlf.ID,
+	tlfName tlf.CanonicalName, bps blockPutState,
+	cacheType DiskBlockCacheType) (blocksToRemove []BlockPointer, err error) {
+	blockCount := bps.numBlocks()
 	log.LazyTrace(ctx, "doBlockPuts with %d blocks", blockCount)
 	defer func() {
 		deferLog.LazyTrace(ctx, "doBlockPuts with %d blocks (err=%v)", blockCount, err)
@@ -105,21 +118,21 @@ func doBlockPuts(ctx context.Context, bserv BlockServer, bcache BlockCache,
 
 	eg, groupCtx := errgroup.WithContext(ctx)
 
-	blocks := make(chan blockState, len(bps.blockStates))
+	blocks := make(chan BlockPointer, blockCount)
 
-	numWorkers := len(bps.blockStates)
+	numWorkers := blockCount
 	if numWorkers > maxParallelBlockPuts {
 		numWorkers = maxParallelBlockPuts
 	}
 	// A channel to list any blocks that have been archived or
 	// deleted.  Any of these will result in an error, so the maximum
 	// we'll get is the same as the number of workers.
-	blocksToRemoveChan := make(chan *FileBlock, numWorkers)
+	blocksToRemoveChan := make(chan BlockPointer, numWorkers)
 
 	worker := func() error {
-		for blockState := range blocks {
+		for ptr := range blocks {
 			err := doOneBlockPut(groupCtx, bserv, reporter, tlfID,
-				tlfName, blockState, blocksToRemoveChan)
+				tlfName, ptr, bps, blocksToRemoveChan, cacheType)
 			if err != nil {
 				return err
 			}
@@ -130,8 +143,8 @@ func doBlockPuts(ctx context.Context, bserv BlockServer, bcache BlockCache,
 		eg.Go(worker)
 	}
 
-	for _, blockState := range bps.blockStates {
-		blocks <- blockState
+	for _, ptr := range bps.ptrs() {
+		blocks <- ptr
 	}
 	close(blocks)
 
@@ -140,23 +153,21 @@ func doBlockPuts(ctx context.Context, bserv BlockServer, bcache BlockCache,
 	if isRecoverableBlockError(err) {
 		// Wait for all the outstanding puts to finish, to amortize
 		// the work of re-doing the put.
-		for fblock := range blocksToRemoveChan {
-			for i, bs := range bps.blockStates {
-				if bs.block == fblock {
-					// Let the caller know which blocks shouldn't be
-					// retried.
-					blocksToRemove = append(blocksToRemove,
-						bps.blockStates[i].blockPtr)
+		for ptr := range blocksToRemoveChan {
+			// Let the caller know which blocks shouldn't be
+			// retried.
+			blocksToRemove = append(blocksToRemove, ptr)
+			if block, err := bps.getBlock(ctx, ptr); err == nil {
+				if fblock, ok := block.(*FileBlock); ok {
+					// Remove each problematic block from the cache so
+					// the redo can just make a new block instead.
+					if err := bcache.DeleteKnownPtr(tlfID, fblock); err != nil {
+						log.CWarningf(
+							ctx, "Couldn't delete ptr for a block: %v", err)
+					}
 				}
 			}
-
-			// Remove each problematic block from the cache so the
-			// redo can just make a new block instead.
-			if err := bcache.DeleteKnownPtr(tlfID, fblock); err != nil {
-				log.CWarningf(ctx, "Couldn't delete ptr for a block: %v", err)
-			}
-			if err := bcache.DeleteTransient(
-				blocksToRemove[len(blocksToRemove)-1], tlfID); err != nil {
+			if err := bcache.DeleteTransient(ptr.ID, tlfID); err != nil {
 				log.CWarningf(ctx, "Couldn't delete block: %v", err)
 			}
 		}

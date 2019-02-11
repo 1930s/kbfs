@@ -148,6 +148,11 @@ func (cb *CommonBlock) NewEmpty() Block {
 	return NewCommonBlock()
 }
 
+// NewEmptier implements the Block interface for CommonBlock.
+func (cb *CommonBlock) NewEmptier() func() Block {
+	return NewCommonBlock
+}
+
 // ToCommonBlock implements the Block interface for CommonBlock.
 func (cb *CommonBlock) ToCommonBlock() *CommonBlock {
 	return cb
@@ -156,6 +161,11 @@ func (cb *CommonBlock) ToCommonBlock() *CommonBlock {
 // IsIndirect implements the Block interface for CommonBlock.
 func (cb *CommonBlock) IsIndirect() bool {
 	return cb.IsInd
+}
+
+// IsTail implements the Block interface for CommonBlock.
+func (cb *CommonBlock) IsTail() bool {
+	panic("CommonBlock doesn't know how to compute IsTail")
 }
 
 // OffsetExceedsData implements the Block interface for CommonBlock.
@@ -219,6 +229,24 @@ func NewDirBlockWithPtrs(isInd bool) BlockWithPtrs {
 // NewEmpty implements the Block interface for DirBlock
 func (db *DirBlock) NewEmpty() Block {
 	return NewDirBlock()
+}
+
+// NewEmptier implements the Block interface for DirBlock.
+func (db *DirBlock) NewEmptier() func() Block {
+	return NewDirBlock
+}
+
+// IsTail implements the Block interface for DirBlock.
+func (db *DirBlock) IsTail() bool {
+	if db.IsInd {
+		return len(db.IPtrs) == 0
+	}
+	for _, de := range db.Children {
+		if de.Type != Sym {
+			return false
+		}
+	}
+	return true
 }
 
 // DataVersion returns data version for this block, which is assumed
@@ -429,6 +457,19 @@ func NewFileBlockWithPtrs(isInd bool) BlockWithPtrs {
 // NewEmpty implements the Block interface for FileBlock
 func (fb *FileBlock) NewEmpty() Block {
 	return &FileBlock{}
+}
+
+// NewEmptier implements the Block interface for FileBlock.
+func (fb *FileBlock) NewEmptier() func() Block {
+	return NewFileBlock
+}
+
+// IsTail implements the Block interface for FileBlock.
+func (fb *FileBlock) IsTail() bool {
+	if fb.IsInd {
+		return len(fb.IPtrs) == 0
+	}
+	return true
 }
 
 // DataVersion returns data version for this block, which is assumed

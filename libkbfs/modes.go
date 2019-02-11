@@ -6,6 +6,7 @@ package libkbfs
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/keybase/client/go/protocol/keybase1"
@@ -23,6 +24,8 @@ func NewInitModeFromType(t InitModeType) InitMode {
 		return modeSingleOp{modeDefault{}}
 	case InitConstrained:
 		return modeConstrained{modeDefault{}}
+	case InitMemoryLimited:
+		return modeMemoryLimited{modeConstrained{modeDefault{}}}
 	default:
 		panic(fmt.Sprintf("Unknown mode: %s", t))
 	}
@@ -48,6 +51,10 @@ func (md modeDefault) BlockWorkers() int {
 
 func (md modeDefault) PrefetchWorkers() int {
 	return defaultPrefetchWorkerQueueSize
+}
+
+func (md modeDefault) DefaultBlockRequestAction() BlockRequestAction {
+	return BlockRequestWithPrefetch
 }
 
 func (md modeDefault) RekeyWorkers() int {
@@ -141,6 +148,10 @@ func (md modeDefault) LocalHTTPServerEnabled() bool {
 	return true
 }
 
+func (md modeDefault) MaxCleanBlockCacheCapacity() uint64 {
+	return math.MaxUint64
+}
+
 // Minimal mode:
 
 type modeMinimal struct {
@@ -158,6 +169,10 @@ func (mm modeMinimal) BlockWorkers() int {
 
 func (mm modeMinimal) PrefetchWorkers() int {
 	return 0
+}
+
+func (mm modeMinimal) DefaultBlockRequestAction() BlockRequestAction {
+	return BlockRequestSolo
 }
 
 func (mm modeMinimal) RekeyWorkers() int {
@@ -264,6 +279,10 @@ func (mm modeMinimal) LocalHTTPServerEnabled() bool {
 	return false
 }
 
+func (mm modeMinimal) MaxCleanBlockCacheCapacity() uint64 {
+	return math.MaxUint64
+}
+
 // Single op mode:
 
 type modeSingleOp struct {
@@ -347,7 +366,11 @@ func (mc modeConstrained) BlockWorkers() int {
 }
 
 func (mc modeConstrained) PrefetchWorkers() int {
-	return 0
+	return 1
+}
+
+func (mc modeConstrained) DefaultBlockRequestAction() BlockRequestAction {
+	return BlockRequestSolo
 }
 
 func (mc modeConstrained) RekeyWorkers() int {
@@ -410,6 +433,48 @@ func (mc modeConstrained) SendEditNotificationsEnabled() bool {
 
 func (mc modeConstrained) LocalHTTPServerEnabled() bool {
 	return true
+}
+
+// Memory limited mode
+
+type modeMemoryLimited struct {
+	InitMode
+}
+
+func (mml modeMemoryLimited) Type() InitModeType {
+	return InitMemoryLimited
+}
+
+func (mml modeMemoryLimited) RekeyWorkers() int {
+	return 0
+}
+
+func (mml modeMemoryLimited) RekeyQueueSize() int {
+	return 0
+}
+
+func (mml modeMemoryLimited) ConflictResolutionEnabled() bool {
+	return false
+}
+
+func (mml modeMemoryLimited) QuotaReclamationEnabled() bool {
+	return false
+}
+
+func (mml modeMemoryLimited) UnmergedTLFsEnabled() bool {
+	return false
+}
+
+func (mml modeMemoryLimited) SendEditNotificationsEnabled() bool {
+	return false
+}
+
+func (mml modeMemoryLimited) LocalHTTPServerEnabled() bool {
+	return false
+}
+
+func (mml modeMemoryLimited) MaxCleanBlockCacheCapacity() uint64 {
+	return 1 * (1 << 20) // 1 MB
 }
 
 // Wrapper for tests.

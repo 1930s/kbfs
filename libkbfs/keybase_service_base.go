@@ -490,6 +490,7 @@ func (k *KeybaseServiceBase) Identify(ctx context.Context, assertion, reason str
 		k.log.CDebugf(ctx,
 			"Ignoring error (%s) for user %s with no sigchain; "+
 				"error type=%T", err, res.Ul.Name, err)
+		ei.onError(ctx)
 	default:
 		// If the caller is waiting for breaks, let them know we got an error.
 		ei.onError(ctx)
@@ -507,7 +508,7 @@ func (k *KeybaseServiceBase) Identify(ctx context.Context, assertion, reason str
 			return kbname.NormalizedUsername(""), keybase1.UserOrTeamID(""), err
 		}
 		ei.userBreak(ctx, name, asUser, res.TrackBreaks)
-	} else {
+	} else if !res.Ul.Id.IsNil() {
 		ei.teamBreak(ctx, res.Ul.Id.AsTeamOrBust(), res.TrackBreaks)
 	}
 
@@ -1099,6 +1100,16 @@ func (k *KeybaseServiceBase) FavoriteList(ctx context.Context, sessionID int) ([
 		return nil, err
 	}
 	return results.FavoriteFolders, nil
+}
+
+// EncryptFavorites encrypts cached favorites to store on disk.
+func (k *KeybaseServiceBase) EncryptFavorites(ctx context.Context, dataToEncrypt []byte) (res []byte, err error) {
+	return k.kbfsClient.EncryptFavorites(ctx, dataToEncrypt)
+}
+
+// DecryptFavorites decrypts cached favorites stored on disk.
+func (k *KeybaseServiceBase) DecryptFavorites(ctx context.Context, dataToEncrypt []byte) (res []byte, err error) {
+	return k.kbfsClient.DecryptFavorites(ctx, dataToEncrypt)
 }
 
 // Notify implements the KeybaseService interface for KeybaseServiceBase.

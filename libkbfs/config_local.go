@@ -70,45 +70,47 @@ const (
 // ConfigLocal implements the Config interface using purely local
 // server objects (no KBFS operations used RPCs).
 type ConfigLocal struct {
-	lock             sync.RWMutex
-	kbfs             KBFSOps
-	keyman           KeyManager
-	rep              Reporter
-	kcache           KeyCache
-	kbcache          kbfsmd.KeyBundleCache
-	bcache           BlockCache
-	dirtyBcache      DirtyBlockCache
-	diskBlockCache   DiskBlockCache
-	diskMDCache      DiskMDCache
-	diskQuotaCache   DiskQuotaCache
-	codec            kbfscodec.Codec
-	mdops            MDOps
-	kops             KeyOps
-	crypto           Crypto
-	chat             Chat
-	mdcache          MDCache
-	bops             BlockOps
-	mdserv           MDServer
-	bserv            BlockServer
-	keyserv          KeyServer
-	service          KeybaseService
-	bsplit           BlockSplitter
-	notifier         Notifier
-	clock            Clock
-	kbpki            KBPKI
-	renamer          ConflictRenamer
-	userHistory      *kbfsedits.UserHistory
-	registry         metrics.Registry
-	loggerFn         func(prefix string) logger.Logger
-	noBGFlush        bool // logic opposite so the default value is the common setting
-	rwpWaitTime      time.Duration
-	diskLimiter      DiskLimiter
-	syncedTlfs       map[tlf.ID]bool
-	defaultBlockType keybase1.BlockType
-	kbfsService      *KBFSService
-	kbCtx            Context
-	rootNodeWrappers []func(Node) Node
-	tlfClearCancels  map[tlf.ID]context.CancelFunc
+	lock               sync.RWMutex
+	kbfs               KBFSOps
+	keyman             KeyManager
+	rep                Reporter
+	kcache             KeyCache
+	kbcache            kbfsmd.KeyBundleCache
+	bcache             BlockCache
+	dirtyBcache        DirtyBlockCache
+	diskBlockCache     DiskBlockCache
+	diskMDCache        DiskMDCache
+	diskQuotaCache     DiskQuotaCache
+	blockMetadataStore BlockMetadataStore
+	xattrStore         XattrStore
+	codec              kbfscodec.Codec
+	mdops              MDOps
+	kops               KeyOps
+	crypto             Crypto
+	chat               Chat
+	mdcache            MDCache
+	bops               BlockOps
+	mdserv             MDServer
+	bserv              BlockServer
+	keyserv            KeyServer
+	service            KeybaseService
+	bsplit             BlockSplitter
+	notifier           Notifier
+	clock              Clock
+	kbpki              KBPKI
+	renamer            ConflictRenamer
+	userHistory        *kbfsedits.UserHistory
+	registry           metrics.Registry
+	loggerFn           func(prefix string) logger.Logger
+	noBGFlush          bool // logic opposite so the default value is the common setting
+	rwpWaitTime        time.Duration
+	diskLimiter        DiskLimiter
+	syncedTlfs         map[tlf.ID]FolderSyncConfig
+	defaultBlockType   keybase1.BlockType
+	kbfsService        *KBFSService
+	kbCtx              Context
+	rootNodeWrappers   []func(Node) Node
+	tlfClearCancels    map[tlf.ID]context.CancelFunc
 
 	maxNameBytes           uint32
 	rekeyQueue             RekeyQueue
@@ -394,7 +396,7 @@ func MakeLocalTeams(teams []kbname.NormalizedUsername) []TeamInfo {
 // the smaller of <1/4 of available memory> and
 // <MaxBlockSizeBytesDefault * DefaultBlocksInMemCache>; otherwise,
 // fallback to latter.
-func getDefaultCleanBlockCacheCapacity() uint64 {
+func getDefaultCleanBlockCacheCapacity(mode InitMode) uint64 {
 	capacity := uint64(MaxBlockSizeBytesDefault) * DefaultBlocksInMemCache
 	vmstat, err := mem.VirtualMemory()
 	if err == nil {
@@ -402,6 +404,9 @@ func getDefaultCleanBlockCacheCapacity() uint64 {
 		if ramBased < capacity {
 			capacity = ramBased
 		}
+	}
+	if capacity > mode.MaxCleanBlockCacheCapacity() {
+		capacity = mode.MaxCleanBlockCacheCapacity()
 	}
 	return capacity
 }
@@ -622,6 +627,13 @@ func (c *ConfigLocal) DiskQuotaCache() DiskQuotaCache {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 	return c.diskQuotaCache
+}
+
+// XattrStore implements the Config interface for ConfigLocal.
+func (c *ConfigLocal) XattrStore() XattrStore {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.xattrStore
 }
 
 // DiskLimiter implements the Config interface for ConfigLocal.
@@ -996,7 +1008,7 @@ func (c *ConfigLocal) resetCachesWithoutShutdown() DirtyBlockCache {
 	log := c.MakeLogger("")
 	var capacity uint64
 	if c.bcache == nil {
-		capacity = getDefaultCleanBlockCacheCapacity()
+		capacity = getDefaultCleanBlockCacheCapacity(c.Mode())
 		log.Debug("setting default clean block cache capacity to %d",
 			capacity)
 	} else {
@@ -1238,6 +1250,10 @@ func (c *ConfigLocal) Shutdown(ctx context.Context) error {
 	dqc := c.DiskQuotaCache()
 	if dqc != nil {
 		dqc.Shutdown(ctx)
+	}
+	bms := c.blockMetadataStore
+	if bms != nil {
+		bms.Shutdown()
 	}
 	kbfsServ := c.kbfsService
 	if kbfsServ != nil {
@@ -1482,6 +1498,25 @@ func (c *ConfigLocal) MakeDiskQuotaCacheIfNotExists() error {
 	return c.resetDiskQuotaCacheLocked()
 }
 
+// MakeBlockMetadataStoreIfNotExists implements the Config interface for
+// ConfigLocal. If error happens, a Noop one is populated.
+func (c *ConfigLocal) MakeBlockMetadataStoreIfNotExists() (err error) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	defer func() {
+		c.xattrStore = NewXattrStoreFromBlockMetadataStore(c.blockMetadataStore)
+	}()
+	if c.blockMetadataStore != nil {
+		return nil
+	}
+	c.blockMetadataStore, err = newDiskBlockMetadataStore(c)
+	if err != nil {
+		// TODO: open read-only instead KBFS-3659
+		return err
+	}
+	return nil
+}
+
 func (c *ConfigLocal) openConfigLevelDB(configName string) (*levelDb, error) {
 	dbPath := filepath.Join(c.storageRoot, configName)
 	stor, err := storage.OpenFile(dbPath, false)
@@ -1492,7 +1527,7 @@ func (c *ConfigLocal) openConfigLevelDB(configName string) (*levelDb, error) {
 }
 
 func (c *ConfigLocal) loadSyncedTlfsLocked() (err error) {
-	syncedTlfs := make(map[tlf.ID]bool)
+	syncedTlfs := make(map[tlf.ID]FolderSyncConfig)
 	if c.IsTestMode() {
 		c.syncedTlfs = syncedTlfs
 		return nil
@@ -1519,7 +1554,7 @@ func (c *ConfigLocal) loadSyncedTlfsLocked() (err error) {
 			deleteBatch.Delete(iter.Key())
 			continue
 		}
-		var config keybase1.FolderSyncConfig
+		var config FolderSyncConfig
 		val := iter.Value()
 		if val != nil {
 			err = c.codec.Decode(val, &config)
@@ -1531,75 +1566,74 @@ func (c *ConfigLocal) loadSyncedTlfsLocked() (err error) {
 			// mean "enabled".
 			config.Mode = keybase1.FolderSyncMode_ENABLED
 		}
-		if config.Mode == keybase1.FolderSyncMode_ENABLED {
-			syncedTlfs[tlfID] = true
-		}
+		syncedTlfs[tlfID] = config
 	}
 	c.syncedTlfs = syncedTlfs
 	return ldb.Write(deleteBatch, nil)
 }
 
-// IsSyncedTlf implements the isSyncedTlfGetter interface for ConfigLocal.
-func (c *ConfigLocal) IsSyncedTlf(tlfID tlf.ID) bool {
+// GetTlfSyncState implements the isSyncedTlfGetter interface for
+// ConfigLocal.
+func (c *ConfigLocal) GetTlfSyncState(tlfID tlf.ID) FolderSyncConfig {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 	return c.syncedTlfs[tlfID]
 }
 
+// IsSyncedTlf implements the isSyncedTlfGetter interface for ConfigLocal.
+func (c *ConfigLocal) IsSyncedTlf(tlfID tlf.ID) bool {
+	return c.GetTlfSyncState(tlfID).Mode == keybase1.FolderSyncMode_ENABLED
+}
+
 // SetTlfSyncState implements the Config interface for ConfigLocal.
-func (c *ConfigLocal) SetTlfSyncState(tlfID tlf.ID, isSynced bool) (
-	<-chan error, error) {
+func (c *ConfigLocal) setTlfSyncState(tlfID tlf.ID, config FolderSyncConfig) (
+	<-chan error, BlockOps, error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	if isSynced {
-		diskCacheWrapped, ok := c.diskBlockCache.(*diskBlockCacheWrapped)
-		if !ok {
-			return nil, errors.Errorf(
-				"invalid disk cache type to set TLF sync state: %T",
-				c.diskBlockCache)
-		}
-		if !diskCacheWrapped.IsSyncCacheEnabled() {
-			return nil, errors.New("sync block cache is not enabled")
-		}
+	diskCacheWrapped, ok := c.diskBlockCache.(*diskBlockCacheWrapped)
+	if !ok {
+		return nil, nil, errors.Errorf(
+			"invalid disk cache type to set TLF sync state: %T",
+			c.diskBlockCache)
 	}
+	if !diskCacheWrapped.IsSyncCacheEnabled() {
+		return nil, nil, errors.New("sync block cache is not enabled")
+	}
+
 	if !c.IsTestMode() {
 		if c.storageRoot == "" {
-			return nil, errors.New(
+			return nil, nil, errors.New(
 				"empty storageRoot specified for non-test run")
 		}
 		ldb, err := c.openConfigLevelDB(syncedTlfConfigFolderName)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		defer ldb.Close()
 		tlfBytes, err := tlfID.MarshalText()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if isSynced {
+		if config.Mode == keybase1.FolderSyncMode_DISABLED {
+			err = ldb.Delete(tlfBytes, nil)
+		} else {
 			if cancel, ok := c.tlfClearCancels[tlfID]; ok {
 				cancel()
 			}
-			config := keybase1.FolderSyncConfig{
-				Mode: keybase1.FolderSyncMode_ENABLED,
-			}
-			buf, err := c.codec.Encode(&config)
+			var buf []byte
+			buf, err = c.codec.Encode(&config)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			err = ldb.Put(tlfBytes, buf, nil)
-		} else {
-			err = ldb.Delete(tlfBytes, nil)
 		}
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
 	ch := make(chan error, 1)
-	if isSynced {
-		ch <- nil
-	} else {
+	if config.Mode == keybase1.FolderSyncMode_DISABLED {
 		// Start a background goroutine deleting all the blocks
 		// from this TLF.
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1610,28 +1644,57 @@ func (c *ConfigLocal) SetTlfSyncState(tlfID tlf.ID, isSynced bool) (
 		diskBlockCache := c.diskBlockCache
 		go func() {
 			defer cancel()
-			ch <- diskBlockCache.ClearAllTlfBlocks(ctx, tlfID)
+			ch <- diskBlockCache.ClearAllTlfBlocks(
+				ctx, tlfID, DiskBlockSyncCache)
 		}()
+	} else {
+		ch <- nil
 	}
 
-	c.syncedTlfs[tlfID] = isSynced
-	<-c.bops.TogglePrefetcher(true)
-	return ch, nil
+	c.syncedTlfs[tlfID] = config
+	return ch, c.bops, nil
+}
+
+// SetTlfSyncState implements the Config interface for ConfigLocal.
+func (c *ConfigLocal) SetTlfSyncState(tlfID tlf.ID, config FolderSyncConfig) (
+	<-chan error, error) {
+	ch, bops, err := c.setTlfSyncState(tlfID, config)
+	// Toggle the prefetcher outside of holding the lock, since the
+	// previous prefetcher might depend on accessing the config.
+	<-bops.TogglePrefetcher(true)
+	return ch, err
+}
+
+// GetAllSyncedTlfs implements the Config interface for ConfigLocal.
+func (c *ConfigLocal) GetAllSyncedTlfs() []tlf.ID {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	tlfs := make([]tlf.ID, 0, len(c.syncedTlfs))
+	for tlf, config := range c.syncedTlfs {
+		if config.Mode != keybase1.FolderSyncMode_DISABLED {
+			tlfs = append(tlfs, tlf)
+		}
+	}
+	return tlfs
 }
 
 // PrefetchStatus implements the Config interface for ConfigLocal.
 func (c *ConfigLocal) PrefetchStatus(ctx context.Context, tlfID tlf.ID,
 	ptr BlockPointer) PrefetchStatus {
-	_, prefetchStatus, _, err := c.BlockCache().GetWithPrefetch(ptr)
-	if err != nil {
-		prefetchStatus = NoPrefetch
-		dbc := c.DiskBlockCache()
-		if dbc != nil {
-			_, _, prefetchStatus, err = dbc.Get(ctx, tlfID, ptr.ID)
-			if err != nil {
-				prefetchStatus = NoPrefetch
-			}
+	dbc := c.DiskBlockCache()
+	if dbc == nil {
+		// We must be in testing mode, so check the block retrieval queue.
+		bops, ok := c.BlockOps().(*BlockOpsStandard)
+		if !ok {
+			return NoPrefetch
 		}
+		return bops.queue.getPrefetchStatus(ptr.ID)
+	}
+
+	_, _, prefetchStatus, err := dbc.Get(
+		ctx, tlfID, ptr.ID, DiskBlockAnyCache)
+	if err != nil {
+		return NoPrefetch
 	}
 	return prefetchStatus
 }

@@ -5,6 +5,7 @@
 package libkbfs
 
 import (
+	"fmt"
 	"io"
 	"math"
 	"path/filepath"
@@ -29,21 +30,22 @@ import (
 
 const (
 	// 10 GB maximum storage by default
-	defaultDiskBlockCacheMaxBytes uint64 = 10 * (1 << 30)
-	defaultBlockCacheTableSize    int    = 50 * opt.MiB
-	evictionConsiderationFactor   int    = 3
-	defaultNumBlocksToEvict       int    = 10
-	numBlocksToEvictOnClear       int    = 100
-	clearTickerDuration                  = 1 * time.Second
-	maxEvictionsPerPut            int    = 4
-	blockDbFilename               string = "diskCacheBlocks.leveldb"
-	metaDbFilename                string = "diskCacheMetadata.leveldb"
-	tlfDbFilename                 string = "diskCacheTLF.leveldb"
-	lastUnrefDbFilename           string = "diskCacheLastUnref.leveldb"
-	initialDiskBlockCacheVersion  uint64 = 1
-	currentDiskBlockCacheVersion  uint64 = initialDiskBlockCacheVersion
-	syncCacheName                 string = "SyncBlockCache"
-	workingSetCacheName           string = "WorkingSetBlockCache"
+	defaultDiskBlockCacheMaxBytes   uint64 = 10 * (1 << 30)
+	defaultBlockCacheTableSize      int    = 50 * opt.MiB
+	evictionConsiderationFactor     int    = 3
+	defaultNumBlocksToEvict         int    = 10
+	defaultNumBlocksToEvictOnClear  int    = 100
+	defaultNumUnmarkedBlocksToCheck int    = 100
+	defaultClearTickerDuration             = 1 * time.Second
+	maxEvictionsPerPut              int    = 4
+	blockDbFilename                 string = "diskCacheBlocks.leveldb"
+	metaDbFilename                  string = "diskCacheMetadata.leveldb"
+	tlfDbFilename                   string = "diskCacheTLF.leveldb"
+	lastUnrefDbFilename             string = "diskCacheLastUnref.leveldb"
+	initialDiskBlockCacheVersion    uint64 = 1
+	currentDiskBlockCacheVersion    uint64 = initialDiskBlockCacheVersion
+	syncCacheName                   string = "SyncBlockCache"
+	workingSetCacheName             string = "WorkingSetBlockCache"
 )
 
 // DiskBlockCacheLocal is the standard implementation for DiskBlockCache.
@@ -52,6 +54,10 @@ type DiskBlockCacheLocal struct {
 	log        logger.Logger
 	maxBlockID []byte
 	dirPath    string
+
+	clearTickerDuration      time.Duration
+	numBlocksToEvictOnClear  int
+	numUnmarkedBlocksToCheck int
 
 	// Track the cache hit rate and eviction rate
 	hitMeter         *CountMeter
@@ -86,8 +92,6 @@ type DiskBlockCacheLocal struct {
 
 	closer func()
 }
-
-var _ DiskBlockCache = (*DiskBlockCacheLocal)(nil)
 
 // DiskBlockCacheStartState represents whether this disk block cache has
 // started or failed.
@@ -200,29 +204,32 @@ func newDiskBlockCacheLocalFromStorage(
 	startedCh := make(chan struct{})
 	startErrCh := make(chan struct{})
 	cache = &DiskBlockCacheLocal{
-		config:           config,
-		maxBlockID:       maxBlockID.Bytes(),
-		cacheType:        cacheType,
-		hitMeter:         NewCountMeter(),
-		missMeter:        NewCountMeter(),
-		putMeter:         NewCountMeter(),
-		updateMeter:      NewCountMeter(),
-		evictCountMeter:  NewCountMeter(),
-		evictSizeMeter:   NewCountMeter(),
-		deleteCountMeter: NewCountMeter(),
-		deleteSizeMeter:  NewCountMeter(),
-		log:              log,
-		blockDb:          blockDb,
-		metaDb:           metaDb,
-		tlfDb:            tlfDb,
-		lastUnrefDb:      lastUnrefDb,
-		tlfCounts:        map[tlf.ID]int{},
-		tlfSizes:         map[tlf.ID]uint64{},
-		tlfLastUnrefs:    map[tlf.ID]kbfsmd.Revision{},
-		startedCh:        startedCh,
-		startErrCh:       startErrCh,
-		shutdownCh:       make(chan struct{}),
-		closer:           closer,
+		config:                   config,
+		maxBlockID:               maxBlockID.Bytes(),
+		clearTickerDuration:      defaultClearTickerDuration,
+		numBlocksToEvictOnClear:  defaultNumBlocksToEvictOnClear,
+		numUnmarkedBlocksToCheck: defaultNumUnmarkedBlocksToCheck,
+		cacheType:                cacheType,
+		hitMeter:                 NewCountMeter(),
+		missMeter:                NewCountMeter(),
+		putMeter:                 NewCountMeter(),
+		updateMeter:              NewCountMeter(),
+		evictCountMeter:          NewCountMeter(),
+		evictSizeMeter:           NewCountMeter(),
+		deleteCountMeter:         NewCountMeter(),
+		deleteSizeMeter:          NewCountMeter(),
+		log:                      log,
+		blockDb:                  blockDb,
+		metaDb:                   metaDb,
+		tlfDb:                    tlfDb,
+		lastUnrefDb:              lastUnrefDb,
+		tlfCounts:                map[tlf.ID]int{},
+		tlfSizes:                 map[tlf.ID]uint64{},
+		tlfLastUnrefs:            map[tlf.ID]kbfsmd.Revision{},
+		startedCh:                startedCh,
+		startErrCh:               startErrCh,
+		shutdownCh:               make(chan struct{}),
+		closer:                   closer,
 	}
 	// Sync the block counts asynchronously so syncing doesn't block init.
 	// Since this method blocks, any Get or Put requests to the disk block
@@ -450,14 +457,6 @@ func (cache *DiskBlockCacheLocal) getMetadataLocked(
 		return DiskBlockCacheMetadata{}, err
 	}
 	err = cache.config.Codec().Decode(metadataBytes, &metadata)
-	if cache.cacheType == workingSetCacheLimitTrackerType {
-		// KBFS-2402: a bug in a previous master caused the wrong prefetch
-		// status to be saved in the working set cache.
-		if metadata.FinishedPrefetch == true {
-			metadata.TriggeredPrefetch = true
-		}
-		metadata.FinishedPrefetch = false
-	}
 	return metadata, err
 }
 
@@ -521,8 +520,8 @@ func (cache *DiskBlockCacheLocal) checkCacheLocked(method string) error {
 }
 
 // Get implements the DiskBlockCache interface for DiskBlockCacheLocal.
-func (cache *DiskBlockCacheLocal) Get(ctx context.Context, tlfID tlf.ID,
-	blockID kbfsblock.ID) (buf []byte,
+func (cache *DiskBlockCacheLocal) Get(
+	ctx context.Context, tlfID tlf.ID, blockID kbfsblock.ID) (buf []byte,
 	serverHalf kbfscrypto.BlockCryptKeyServerHalf,
 	prefetchStatus PrefetchStatus, err error) {
 	cache.lock.RLock()
@@ -589,8 +588,8 @@ func (cache *DiskBlockCacheLocal) evictUntilBytesAvailable(
 }
 
 // Put implements the DiskBlockCache interface for DiskBlockCacheLocal.
-func (cache *DiskBlockCacheLocal) Put(ctx context.Context, tlfID tlf.ID,
-	blockID kbfsblock.ID, buf []byte,
+func (cache *DiskBlockCacheLocal) Put(
+	ctx context.Context, tlfID tlf.ID, blockID kbfsblock.ID, buf []byte,
 	serverHalf kbfscrypto.BlockCryptKeyServerHalf) (err error) {
 	cache.lock.Lock()
 	defer cache.lock.Unlock()
@@ -618,11 +617,6 @@ func (cache *DiskBlockCacheLocal) Put(ctx context.Context, tlfID tlf.ID,
 	}
 	if !hasKey {
 		if cache.cacheType == syncCacheLimitTrackerType {
-			if !cache.config.IsSyncedTlf(tlfID) {
-				// TODO: Make better error type
-				return errors.New("Attempted to add a block of an unsynced " +
-					"TLF to the sync disk cache.")
-			}
 			bytesAvailable, err := cache.config.DiskLimiter().reserveBytes(
 				ctx, cache.cacheType, encodedLen)
 			if err != nil {
@@ -873,6 +867,10 @@ func (cache *DiskBlockCacheLocal) evictFromTLFLocked(ctx context.Context,
 			continue
 		}
 		blockID, err := kbfsblock.IDFromBytes(blockIDBytes)
+		if err != nil {
+			cache.log.CWarningf(ctx, "Error getting id from bytes %x", blockIDBytes)
+			continue
+		}
 		lru, err := cache.getLRULocked(blockID)
 		if err != nil {
 			cache.log.CWarningf(ctx, "Error decoding LRU time for block %s",
@@ -916,11 +914,11 @@ func (cache *DiskBlockCacheLocal) evictLocked(ctx context.Context,
 		}
 		key := iter.Key()
 
+		blockID, err := kbfsblock.IDFromBytes(key)
 		if err != nil {
-			cache.log.CWarningf(ctx, "Error decoding block ID %x", key)
+			cache.log.CWarningf(ctx, "Error getting id from bytes %x", key)
 			continue
 		}
-		blockID, err := kbfsblock.IDFromBytes(key)
 		metadata := DiskBlockCacheMetadata{}
 		err = cache.config.Codec().Decode(iter.Value(), &metadata)
 		if err != nil {
@@ -949,7 +947,8 @@ func (cache *DiskBlockCacheLocal) deleteNextBatchFromClearedTlf(
 	default:
 	}
 
-	_, _, err = cache.evictFromTLFLocked(ctx, tlfID, numBlocksToEvictOnClear)
+	_, _, err = cache.evictFromTLFLocked(
+		ctx, tlfID, cache.numBlocksToEvictOnClear)
 	if err != nil {
 		return 0, err
 	}
@@ -980,7 +979,7 @@ func (cache *DiskBlockCacheLocal) ClearAllTlfBlocks(
 		cache.log.CDebugf(
 			ctx, "%d blocks left to delete from %s", numLeft, tlfID)
 
-		c := time.After(clearTickerDuration)
+		c := time.After(cache.clearTickerDuration)
 		select {
 		case <-c:
 		case <-ctx.Done():
@@ -1094,16 +1093,135 @@ func (cache *DiskBlockCacheLocal) Status(
 	}
 }
 
-// DoesSyncCacheHaveSpace returns true if we have more than 1% of space left in
-// the sync cache.
-func (cache *DiskBlockCacheLocal) DoesSyncCacheHaveSpace(
+// DoesCacheHaveSpace returns true if we have more than 1% of space
+// left in the cache.
+func (cache *DiskBlockCacheLocal) DoesCacheHaveSpace(
 	ctx context.Context) bool {
-	if cache.cacheType != syncCacheLimitTrackerType {
-		return false
-	}
 	limiterStatus := cache.config.DiskLimiter().getStatus(
 		ctx, keybase1.UserOrTeamID("")).(backpressureDiskLimiterStatus)
-	return limiterStatus.SyncCacheByteStatus.UsedFrac <= .99
+	switch cache.cacheType {
+	case syncCacheLimitTrackerType:
+		return limiterStatus.SyncCacheByteStatus.UsedFrac <= .99
+	case workingSetCacheLimitTrackerType:
+		return limiterStatus.DiskCacheByteStatus.UsedFrac <= .99
+	default:
+		panic(fmt.Sprintf("Unknown cache type: %d", cache.cacheType))
+	}
+}
+
+// Mark updates the metadata of the given block with the tag.
+func (cache *DiskBlockCacheLocal) Mark(
+	ctx context.Context, blockID kbfsblock.ID, tag string) error {
+	cache.lock.Lock()
+	defer cache.lock.Unlock()
+	err := cache.checkCacheLocked("Block(UpdateMetadata)")
+	if err != nil {
+		return err
+	}
+
+	md, err := cache.getMetadataLocked(blockID, false)
+	if err != nil {
+		return NoSuchBlockError{blockID}
+	}
+	md.Tag = tag
+	return cache.updateMetadataLocked(ctx, blockID.Bytes(), md, false)
+}
+
+func (cache *DiskBlockCacheLocal) deleteNextUnmarkedBatchFromTlf(
+	ctx context.Context, tlfID tlf.ID, tag string, startingKey []byte) (
+	nextKey []byte, err error) {
+	cache.lock.Lock()
+	defer cache.lock.Unlock()
+	err = cache.checkCacheLocked("Block(deleteNextUnmarkedBatchFromTlf)")
+	if err != nil {
+		return nil, err
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	tlfBytes := tlfID.Bytes()
+	rng := &util.Range{
+		Start: startingKey,
+		Limit: append(tlfBytes, cache.maxBlockID...),
+	}
+	iter := cache.tlfDb.NewIterator(rng, nil)
+	defer iter.Release()
+
+	blockIDs := make([]kbfsblock.ID, 0, cache.numUnmarkedBlocksToCheck)
+	for i := 0; i < cache.numUnmarkedBlocksToCheck; i++ {
+		if !iter.Next() {
+			break
+		}
+		key := iter.Key()
+
+		blockIDBytes := key[len(tlfBytes):]
+		blockID, err := kbfsblock.IDFromBytes(blockIDBytes)
+		if err != nil {
+			cache.log.CWarningf(ctx, "Error decoding block ID %x", blockIDBytes)
+			continue
+		}
+		md, err := cache.getMetadataLocked(blockID, false)
+		if err != nil {
+			cache.log.CWarningf(
+				ctx, "No metadata for %s while checking mark", blockID)
+			continue
+		}
+		if md.Tag != tag {
+			blockIDs = append(blockIDs, blockID)
+		}
+	}
+
+	if iter.Next() {
+		nextKey = iter.Key()
+	}
+
+	if len(blockIDs) > 0 {
+		cache.log.CDebugf(ctx, "Deleting %d unmarked blocks (tag=%s) from %s",
+			len(blockIDs), tag, tlfID)
+		_, _, err = cache.deleteLocked(ctx, blockIDs)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return nextKey, nil
+}
+
+// DeleteUnmarked deletes all the blocks without the given tag.
+func (cache *DiskBlockCacheLocal) DeleteUnmarked(
+	ctx context.Context, tlfID tlf.ID, tag string) (err error) {
+	defer func() {
+		cache.log.CDebugf(ctx,
+			"Finished deleting unmarked blocks (tag=%s) from %s: %+v",
+			tag, tlfID, err)
+	}()
+
+	// Delete the blocks in batches, so we don't keep the lock for too
+	// long.
+	startingKey := cache.tlfKey(tlfID, nil)
+	for {
+		cache.log.CDebugf(
+			ctx, "Deleting a batch of unmarked blocks (tag=%s) from %s",
+			tag, tlfID)
+		startingKey, err = cache.deleteNextUnmarkedBatchFromTlf(
+			ctx, tlfID, tag, startingKey)
+		if err != nil {
+			return err
+		}
+		if startingKey == nil {
+			return nil
+		}
+
+		c := time.After(cache.clearTickerDuration)
+		select {
+		case <-c:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // Shutdown implements the DiskBlockCache interface for DiskBlockCacheLocal.

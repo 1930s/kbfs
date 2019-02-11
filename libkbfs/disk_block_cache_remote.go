@@ -51,7 +51,7 @@ func NewDiskBlockCacheRemote(kbCtx Context, config diskBlockCacheRemoteConfig) (
 
 // Get implements the DiskBlockCache interface for DiskBlockCacheRemote.
 func (dbcr *DiskBlockCacheRemote) Get(ctx context.Context, tlfID tlf.ID,
-	blockID kbfsblock.ID) (buf []byte,
+	blockID kbfsblock.ID, _ DiskBlockCacheType) (buf []byte,
 	serverHalf kbfscrypto.BlockCryptKeyServerHalf,
 	prefetchStatus PrefetchStatus, err error) {
 	dbcr.log.LazyTrace(ctx, "DiskBlockCacheRemote: Get %s", blockID)
@@ -79,7 +79,8 @@ func (dbcr *DiskBlockCacheRemote) Get(ctx context.Context, tlfID tlf.ID,
 // Put implements the DiskBlockCache interface for DiskBlockCacheRemote.
 func (dbcr *DiskBlockCacheRemote) Put(ctx context.Context, tlfID tlf.ID,
 	blockID kbfsblock.ID, buf []byte,
-	serverHalf kbfscrypto.BlockCryptKeyServerHalf) (err error) {
+	serverHalf kbfscrypto.BlockCryptKeyServerHalf,
+	_ DiskBlockCacheType) (err error) {
 	dbcr.log.LazyTrace(ctx, "DiskBlockCacheRemote: Put %s", blockID)
 	defer func() {
 		dbcr.log.LazyTrace(ctx, "DiskBlockCacheRemote: Put %s done (err=%+v)", blockID, err)
@@ -128,21 +129,23 @@ func (dbcr *DiskBlockCacheRemote) UpdateMetadata(ctx context.Context,
 // ClearAllTlfBlocks implements the DiskBlockCache interface for
 // DiskBlockCacheRemote.
 func (dbcr *DiskBlockCacheRemote) ClearAllTlfBlocks(
-	_ context.Context, _ tlf.ID) error {
+	_ context.Context, _ tlf.ID, _ DiskBlockCacheType) error {
 	panic("ClearAllTlfBlocks() not implemented in DiskBlockCacheRemote")
 }
 
 // GetLastUnrefRev implements the DiskBlockCache interface for
 // DiskBlockCacheRemote.
 func (dbcr *DiskBlockCacheRemote) GetLastUnrefRev(
-	_ context.Context, _ tlf.ID) (kbfsmd.Revision, error) {
+	_ context.Context, _ tlf.ID, _ DiskBlockCacheType) (
+	kbfsmd.Revision, error) {
 	panic("GetLastUnrefRev() not implemented in DiskBlockCacheRemote")
 }
 
 // PutLastUnrefRev implements the DiskBlockCache interface for
 // DiskBlockCacheRemote.
 func (dbcr *DiskBlockCacheRemote) PutLastUnrefRev(
-	_ context.Context, _ tlf.ID, _ kbfsmd.Revision) error {
+	_ context.Context, _ tlf.ID, _ kbfsmd.Revision,
+	_ DiskBlockCacheType) error {
 	panic("PutLastUnrefRev() not implemented in DiskBlockCacheRemote")
 }
 
@@ -153,11 +156,26 @@ func (dbcr *DiskBlockCacheRemote) Status(ctx context.Context) map[string]DiskBlo
 	panic("Status() not implemented in DiskBlockCacheRemote")
 }
 
-// DoesSyncCacheHaveSpace implements the DiskBlockCache interface for
+// DoesCacheHaveSpace implements the DiskBlockCache interface for
 // DiskBlockCacheRemote.
-func (dbcr *DiskBlockCacheRemote) DoesSyncCacheHaveSpace(
-	_ context.Context) bool {
-	panic("DoesSyncCacheHaveSpace() not implemented in DiskBlockCacheRemote")
+func (dbcr *DiskBlockCacheRemote) DoesCacheHaveSpace(
+	_ context.Context, _ DiskBlockCacheType) (bool, error) {
+	// We won't be kicking off long syncing prefetching via the remote
+	// cache, so just pretend the cache has space.
+	return true, nil
+}
+
+// Mark implements the DiskBlockCache interface for DiskBlockCacheRemote.
+func (dbcr *DiskBlockCacheRemote) Mark(
+	_ context.Context, _ kbfsblock.ID, _ string, _ DiskBlockCacheType) error {
+	panic("Mark() not implemented in DiskBlockCacheRemote")
+}
+
+// DeleteUnmarked implements the DiskBlockCache interface for
+// DiskBlockCacheRemote.
+func (dbcr *DiskBlockCacheRemote) DeleteUnmarked(
+	_ context.Context, _ tlf.ID, _ string, _ DiskBlockCacheType) error {
+	panic("DeleteUnmarked() not implemented in DiskBlockCacheRemote")
 }
 
 // Shutdown implements the DiskBlockCache interface for DiskBlockCacheRemote.

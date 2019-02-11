@@ -132,8 +132,8 @@ var _ Chat = (*ChatRPC)(nil)
 //
 // When sending:
 //   * chat1.NewConversationLocal
-//   * chat1.PostTestNonblock
-//     * ClientPrev can be 0.  Can outbox ID be nil?
+//   * chat1.PostLocalNonblock
+//     * ClientPrev can be 0.  Can outbox ID be nil? mikem: yes
 
 // Gathering recent notifications:
 //   * chat1.GetInboxAndUnboxLocal (pagination not needed)
@@ -272,14 +272,21 @@ func (c *ChatRPC) SendTextMessage(
 		return nil
 	}
 
-	arg := chat1.PostTextNonblockArg{
-		ConversationID:   convID,
-		TlfName:          string(tlfName),
-		TlfPublic:        tlfType == tlf.Public,
-		Body:             body,
+	arg := chat1.PostLocalNonblockArg{
+		ConversationID: convID,
+		Msg: chat1.MessagePlaintext{
+			ClientHeader: chat1.MessageClientHeader{
+				TlfName:     string(tlfName),
+				TlfPublic:   tlfType == tlf.Public,
+				MessageType: chat1.MessageType_TEXT,
+			},
+			MessageBody: chat1.NewMessageBodyWithText(chat1.MessageText{
+				Body: body,
+			}),
+		},
 		IdentifyBehavior: keybase1.TLFIdentifyBehavior_KBFS_CHAT,
 	}
-	_, err := c.client.PostTextNonblock(ctx, arg)
+	_, err := c.client.PostLocalNonblock(ctx, arg)
 	if err != nil {
 		return err
 	}
@@ -322,14 +329,21 @@ func (c *ChatRPC) SendTextMessage(
 		return err
 	}
 
-	arg = chat1.PostTextNonblockArg{
-		ConversationID:   selfConvID,
-		TlfName:          string(session.Name),
-		TlfPublic:        false,
-		Body:             selfWriteBody,
+	arg = chat1.PostLocalNonblockArg{
+		ConversationID: selfConvID,
+		Msg: chat1.MessagePlaintext{
+			ClientHeader: chat1.MessageClientHeader{
+				TlfName:     string(session.Name),
+				TlfPublic:   false,
+				MessageType: chat1.MessageType_TEXT,
+			},
+			MessageBody: chat1.NewMessageBodyWithText(chat1.MessageText{
+				Body: selfWriteBody,
+			}),
+		},
 		IdentifyBehavior: keybase1.TLFIdentifyBehavior_KBFS_CHAT,
 	}
-	_, err = c.client.PostTextNonblock(ctx, arg)
+	_, err = c.client.PostLocalNonblock(ctx, arg)
 	if err != nil {
 		return err
 	}
@@ -403,10 +417,22 @@ func (c *ChatRPC) GetGroupedInbox(
 		Query: &chat1.GetInboxLocalQuery{
 			TopicType: &chatType,
 		},
+		IdentifyBehavior: keybase1.TLFIdentifyBehavior_KBFS_CHAT,
 	}
 	res, err := c.client.GetInboxAndUnboxLocal(ctx, arg)
 	if err != nil {
 		return nil, err
+	}
+
+	favorites, err := c.config.KBFSOps().GetFavorites(ctx)
+	if err != nil {
+		c.log.CWarningf(ctx,
+			"Unable to fetch favorites while making GroupedInbox: %v",
+			err)
+	}
+	favMap := make(map[Favorite]bool)
+	for _, fav := range favorites {
+		favMap[fav] = true
 	}
 
 	// Return the first unique `maxChats` chats.  Eventually the
@@ -420,13 +446,16 @@ func (c *ChatRPC) GetGroupedInbox(
 			continue
 		}
 
-		// TODO: ignore TLFs that aren't in your favorites list.
-
 		tlfType := tlf.Private
 		if info.Visibility == keybase1.TLFVisibility_PUBLIC {
 			tlfType = tlf.Public
 		} else if info.MembersType == chat1.ConversationMembersType_TEAM {
 			tlfType = tlf.SingleTeam
+		}
+
+		tlfIsFavorite := favMap[Favorite{Name: info.TlfName, Type: tlfType}]
+		if !tlfIsFavorite {
+			continue
 		}
 
 		h, err := GetHandleFromFolderNameAndType(
@@ -467,6 +496,7 @@ func (c *ChatRPC) GetChannels(
 			TopicType:     &chatType,
 			TlfVisibility: &expectedVisibility,
 		},
+		IdentifyBehavior: keybase1.TLFIdentifyBehavior_KBFS_CHAT,
 	}
 	res, err := c.client.GetInboxAndUnboxLocal(ctx, arg)
 	if err != nil {
@@ -578,6 +608,24 @@ func (c *ChatRPC) newNotificationChannel(
 	} else if conv.MembersType == chat1.ConversationMembersType_TEAM {
 		tlfType = tlf.SingleTeam
 	}
+
+	favorites, err := c.config.KBFSOps().GetFavorites(ctx)
+	if err != nil {
+		c.log.CWarningf(ctx,
+			"Unable to fetch favorites while making edit notifications: %v",
+			err)
+	}
+	tlfIsFavorite := false
+	for _, fav := range favorites {
+		if fav.Name == conv.Name && fav.Type == tlfType {
+			tlfIsFavorite = true
+			break
+		}
+	}
+	if !tlfIsFavorite {
+		return nil
+	}
+
 	tlfHandle, err := GetHandleFromFolderNameAndType(
 		ctx, c.config.KBPKI(), c.config.MDOps(), conv.Name, tlfType)
 	if err != nil {

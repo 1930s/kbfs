@@ -47,6 +47,7 @@ type tlfJournalConfig interface {
 	diskLimitTimeout() time.Duration
 	teamMembershipChecker() kbfsmd.TeamMembershipChecker
 	BGFlushDirOpBatchSize() int
+	syncedTlfGetterSetter
 }
 
 // tlfJournalConfigWrapper is an adapter for Config objects to the
@@ -1096,7 +1097,7 @@ func (j *tlfJournal) flushBlockEntries(
 	}
 
 	j.log.CDebugf(ctx, "Flushing %d blocks, up to rev %d",
-		len(entries.puts.blockStates), maxMDRevToFlush)
+		entries.puts.numBlocks(), maxMDRevToFlush)
 
 	// Mark these blocks as flushing, and clear when done.
 	err = j.markFlushingBlockIDs(entries)
@@ -1134,9 +1135,13 @@ func (j *tlfJournal) flushBlockEntries(
 	j.startFlush(bytesToFlush)
 	eg.Go(func() error {
 		defer convertCancel()
+		cacheType := DiskBlockAnyCache
+		if j.config.IsSyncedTlf(j.tlfID) {
+			cacheType = DiskBlockSyncCache
+		}
 		return flushBlockEntries(groupCtx, j.log, j.deferLog,
 			j.delegateBlockServer, j.config.BlockCache(), j.config.Reporter(),
-			j.tlfID, tlfName, entries)
+			j.tlfID, tlfName, entries, cacheType)
 	})
 	converted = false
 	eg.Go(func() error {

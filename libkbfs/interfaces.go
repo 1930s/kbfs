@@ -99,6 +99,12 @@ type diskQuotaCacheSetter interface {
 	MakeDiskQuotaCacheIfNotExists() error
 }
 
+type blockMetadataStoreGetSeter interface {
+	MakeBlockMetadataStoreIfNotExists() error
+	XattrStore() XattrStore
+	// Other metadata store types goes here.
+}
+
 type clockGetter interface {
 	Clock() Clock
 }
@@ -109,7 +115,9 @@ type diskLimiterGetter interface {
 
 type syncedTlfGetterSetter interface {
 	IsSyncedTlf(tlfID tlf.ID) bool
-	SetTlfSyncState(tlfID tlf.ID, isSynced bool) (<-chan error, error)
+	GetTlfSyncState(tlfID tlf.ID) FolderSyncConfig
+	SetTlfSyncState(tlfID tlf.ID, config FolderSyncConfig) (<-chan error, error)
+	GetAllSyncedTlfs() []tlf.ID
 }
 
 type blockRetrieverGetter interface {
@@ -134,12 +142,18 @@ type Block interface {
 	SetEncodedSize(size uint32)
 	// NewEmpty returns a new block of the same type as this block
 	NewEmpty() Block
+	// NewEmptier returns a function that creates a new block of the
+	// same type as this block.
+	NewEmptier() func() Block
 	// Set sets this block to the same value as the passed-in block
 	Set(other Block)
 	// ToCommonBlock retrieves this block as a *CommonBlock.
 	ToCommonBlock() *CommonBlock
 	// IsIndirect indicates whether this block contains indirect pointers.
 	IsIndirect() bool
+	// IsTail returns true if this block doesn't point to any other
+	// blocks, either indirectly or in child directory entries.
+	IsTail() bool
 	// OffsetExceedsData returns true if `off` is greater than the
 	// data contained in a direct block, assuming it starts at
 	// `startOff`.  Note that the offset of the next block isn't
@@ -267,6 +281,8 @@ type Node interface {
 	GetFile(ctx context.Context) billy.File
 	// EntryType is the type of the entry represented by this node.
 	EntryType() EntryType
+	// GetBlockID returns the block ID of the node.
+	GetBlockID() kbfsblock.ID
 }
 
 // KBFSOps handles all file system operations.  Expands all indirect
@@ -311,6 +327,9 @@ type KBFSOps interface {
 	// effects are asychronous; if there's an error refreshing the
 	// favorites, the cached favorites will become empty.
 	RefreshCachedFavorites(ctx context.Context)
+	// ClearCachedFavorites tells the instances to forget any cached
+	// favorites list, e.g. when a user logs out.
+	ClearCachedFavorites(ctx context.Context)
 	// AddFavorite adds the favorite to both the server and
 	// the local cache.
 	AddFavorite(ctx context.Context, fav Favorite) error
@@ -318,6 +337,9 @@ type KBFSOps interface {
 	// the local cache.  Idempotent, so it succeeds even if the folder
 	// isn't favorited.
 	DeleteFavorite(ctx context.Context, fav Favorite) error
+	// RefreshEditHistory asks the FBO for the given favorite to reload its
+	// edit history.
+	RefreshEditHistory(fav Favorite)
 
 	// GetTLFCryptKeys gets crypt key of all generations as well as
 	// TLF ID for tlfHandle. The returned keys (the keys slice) are ordered by
@@ -541,6 +563,21 @@ type KBFSOps interface {
 	// called after explicit user confirmation.  After the call,
 	// `handle` has the new TLF ID.
 	Reset(ctx context.Context, handle *TlfHandle) error
+
+	// GetSyncConfig returns the sync state configuration for the
+	// given TLF.
+	GetSyncConfig(ctx context.Context, tlfID tlf.ID) (
+		keybase1.FolderSyncConfig, error)
+	// SetSyncConfig sets the sync state configuration for the given
+	// TLF to either fully enabled, fully disabled, or partially
+	// syncing selected paths.  If syncing is disabled, it returns a
+	// channel that is closed when all of the TLF's blocks have been
+	// removed from the sync cache.  For a partially-synced folder,
+	// the config must contain no absolute paths, no duplicate paths,
+	// and no relative paths that go out of the TLF.
+	SetSyncConfig(
+		ctx context.Context, tlfID tlf.ID, config keybase1.FolderSyncConfig) (
+		<-chan error, error)
 }
 
 type merkleRootGetter interface {
@@ -654,6 +691,12 @@ type KeybaseService interface {
 
 	// FavoriteList returns the current list of favorites.
 	FavoriteList(ctx context.Context, sessionID int) ([]keybase1.Folder, error)
+
+	// EncryptFavorites encrypts cached favorites to store on disk.
+	EncryptFavorites(ctx context.Context, dataToEncrypt []byte) ([]byte, error)
+
+	// DecryptFavorites decrypts cached favorites stored on disk.
+	DecryptFavorites(ctx context.Context, dataToDecrypt []byte) ([]byte, error)
 
 	// Notify sends a filesystem notification.
 	Notify(ctx context.Context, notification *keybase1.FSNotification) error
@@ -1122,9 +1165,9 @@ type BlockCache interface {
 	// a nil error.
 	CheckForKnownPtr(tlf tlf.ID, block *FileBlock) (BlockPointer, error)
 	// DeleteTransient removes the transient entry for the given
-	// pointer from the cache, as well as any cached IDs so the block
+	// ID from the cache, as well as any cached IDs so the block
 	// won't be reused.
-	DeleteTransient(ptr BlockPointer, tlf tlf.ID) error
+	DeleteTransient(id kbfsblock.ID, tlf tlf.ID) error
 	// Delete removes the permanent entry for the non-dirty block
 	// associated with the given block ID from the cache.  No
 	// error is returned if no block exists for the given ID.
@@ -1132,14 +1175,10 @@ type BlockCache interface {
 	// DeleteKnownPtr removes the cached ID for the given file
 	// block. It does not remove the block itself.
 	DeleteKnownPtr(tlf tlf.ID, block *FileBlock) error
-	// GetWithPrefetch retrieves a block from the cache, along with the block's
-	// prefetch status.
-	GetWithPrefetch(ptr BlockPointer) (block Block,
-		prefetchStatus PrefetchStatus, lifetime BlockCacheLifetime, err error)
-	// PutWithPrefetch puts a block into the cache, along with whether or not
-	// it has triggered or finished a prefetch.
-	PutWithPrefetch(ptr BlockPointer, tlf tlf.ID, block Block,
-		lifetime BlockCacheLifetime, prefetchStatus PrefetchStatus) error
+	// GetWithLifetime retrieves a block from the cache, along with
+	// the block's lifetime.
+	GetWithLifetime(ptr BlockPointer) (
+		block Block, lifetime BlockCacheLifetime, err error)
 
 	// SetCleanBytesCapacity atomically sets clean bytes capacity for block
 	// cache.
@@ -1156,6 +1195,21 @@ type BlockCache interface {
 // struct{}.
 type DirtyPermChan <-chan struct{}
 
+// DirtyBlockCacheSimple is a bare-bones interface for a dirty block
+// cache.
+type DirtyBlockCacheSimple interface {
+	// Get gets the block associated with the given block ID.  Returns
+	// the dirty block for the given ID, if one exists.
+	Get(
+		ctx context.Context, tlfID tlf.ID, ptr BlockPointer,
+		branch BranchName) (Block, error)
+	// Put stores a dirty block currently identified by the
+	// given block pointer and branch name.
+	Put(
+		ctx context.Context, tlfID tlf.ID, ptr BlockPointer, branch BranchName,
+		block Block) error
+}
+
 type isDirtyProvider interface {
 	// IsDirty states whether or not the block associated with the
 	// given block pointer and branch name is dirty in this cache.
@@ -1171,13 +1225,8 @@ type isDirtyProvider interface {
 // they must be deleted explicitly.
 type DirtyBlockCache interface {
 	isDirtyProvider
+	DirtyBlockCacheSimple
 
-	// Get gets the block associated with the given block ID.  Returns
-	// the dirty block for the given ID, if one exists.
-	Get(tlfID tlf.ID, ptr BlockPointer, branch BranchName) (Block, error)
-	// Put stores a dirty block currently identified by the
-	// given block pointer and branch name.
-	Put(tlfID tlf.ID, ptr BlockPointer, branch BranchName, block Block) error
 	// Delete removes the dirty block associated with the given block
 	// pointer and branch from the cache.  No error is returned if no
 	// block exists for the given ID.
@@ -1235,16 +1284,49 @@ type DirtyBlockCache interface {
 	Shutdown() error
 }
 
+// DiskBlockCacheType specifies a type of an on-disk block cache.
+type DiskBlockCacheType int
+
+const (
+	// DiskBlockAnyCache indicates that any disk block cache is fine.
+	DiskBlockAnyCache DiskBlockCacheType = iota
+	// DiskBlockWorkingSetCache indicates that the working set cache
+	// should be used.
+	DiskBlockWorkingSetCache
+	// DiskBlockSyncCache indicates that the sync cache should be
+	// used.
+	DiskBlockSyncCache
+)
+
+func (dbct DiskBlockCacheType) String() string {
+	switch dbct {
+	case DiskBlockSyncCache:
+		return "DiskBlockSyncCache"
+	case DiskBlockWorkingSetCache:
+		return "DiskBlockWorkingSetCache"
+	case DiskBlockAnyCache:
+		return "DiskBlockAnyCache"
+	default:
+		return "unknown DiskBlockCacheType"
+	}
+}
+
 // DiskBlockCache caches blocks to the disk.
 type DiskBlockCache interface {
-	// Get gets a block from the disk cache.
-	Get(ctx context.Context, tlfID tlf.ID, blockID kbfsblock.ID) (
+	// Get gets a block from the disk cache.  If a specific preferred
+	// cache type is given, the block and its metadata are moved to
+	// that cache if they're not yet in it.
+	Get(ctx context.Context, tlfID tlf.ID, blockID kbfsblock.ID,
+		preferredCacheType DiskBlockCacheType) (
 		buf []byte, serverHalf kbfscrypto.BlockCryptKeyServerHalf,
 		prefetchStatus PrefetchStatus, err error)
-	// Put puts a block to the disk cache. Returns after it has updated the
-	// metadata but before it has finished writing the block.
+	// Put puts a block to the disk cache. Returns after it has
+	// updated the metadata but before it has finished writing the
+	// block.  If cacheType is specified, the block is put into that
+	// cache; by default, block are put into the working set cache.
 	Put(ctx context.Context, tlfID tlf.ID, blockID kbfsblock.ID, buf []byte,
-		serverHalf kbfscrypto.BlockCryptKeyServerHalf) error
+		serverHalf kbfscrypto.BlockCryptKeyServerHalf,
+		cacheType DiskBlockCacheType) error
 	// Delete deletes some blocks from the disk cache.
 	Delete(ctx context.Context, blockIDs []kbfsblock.ID) (numRemoved int,
 		sizeRemoved int64, err error)
@@ -1254,20 +1336,33 @@ type DiskBlockCache interface {
 	// ClearAllTlfBlocks deletes all the synced blocks corresponding
 	// to the given TLF ID from the cache.  It doesn't affect
 	// transient blocks for unsynced TLFs.
-	ClearAllTlfBlocks(ctx context.Context, tlfID tlf.ID) error
+	ClearAllTlfBlocks(
+		ctx context.Context, tlfID tlf.ID, cacheType DiskBlockCacheType) error
 	// GetLastUnrefRev returns the last revision that has been marked
 	// unref'd for the given TLF.
-	GetLastUnrefRev(ctx context.Context, tlfID tlf.ID) (kbfsmd.Revision, error)
+	GetLastUnrefRev(
+		ctx context.Context, tlfID tlf.ID, cacheType DiskBlockCacheType) (
+		kbfsmd.Revision, error)
 	// PutLastUnrefRev saves the given revision as the last unref'd
 	// revision for the given TLF.
 	PutLastUnrefRev(
-		ctx context.Context, tlfID tlf.ID, rev kbfsmd.Revision) error
+		ctx context.Context, tlfID tlf.ID, rev kbfsmd.Revision,
+		cacheType DiskBlockCacheType) error
 	// Status returns the current status of the disk cache.
 	Status(ctx context.Context) map[string]DiskBlockCacheStatus
-	// DoesSyncCacheHaveSpace returns whether the sync cache has
-	// space.  If this cache doesn't contain a sync cache, always returns
-	// true.
-	DoesSyncCacheHaveSpace(ctx context.Context) bool
+	// DoesCacheHaveSpace returns whether the given cache has
+	// space.
+	DoesCacheHaveSpace(
+		ctx context.Context, cacheType DiskBlockCacheType) (bool, error)
+	// Mark tags a given block in the disk cache with the given tag.
+	Mark(
+		ctx context.Context, blockID kbfsblock.ID, tag string,
+		cacheType DiskBlockCacheType) error
+	// DeleteUnmarked deletes all the given TLF's blocks in the disk
+	// cache without the given tag.
+	DeleteUnmarked(
+		ctx context.Context, tlfID tlf.ID, tag string,
+		cacheType DiskBlockCacheType) error
 	// Shutdown cleanly shuts down the disk block cache.
 	Shutdown(ctx context.Context)
 }
@@ -1315,6 +1410,36 @@ type DiskQuotaCache interface {
 	Status(ctx context.Context) DiskQuotaCacheStatus
 	// Shutdown cleanly shuts down the disk quota cache.
 	Shutdown(ctx context.Context)
+}
+
+// BlockMetadataStore defines a type that stores block metadata locally on
+// device.
+type BlockMetadataStore interface {
+	// GetMetadata looks for and returns the block metadata for blockID if it's
+	// found, and an error whose Cause is ldberrors.ErrNotFound if it's not
+	// found.
+	GetMetadata(ctx context.Context, blockID kbfsblock.ID) (BlockMetadataValue, error)
+	// UpdateMetadata updates the block metadata for blockID using updater.
+	// Specifically, it looks for existing block metdata for blockID. If it's
+	// found, it's passed into updater. Otherwise, a zero value of
+	// BlockMetadataValue is passed into the updater. After if updater returns
+	// nil, the updated metadata is stored.
+	UpdateMetadata(ctx context.Context, blockID kbfsblock.ID, updater BlockMetadataUpdater) error
+	// Shutdown cleanly shuts down the disk block metadata cache.
+	Shutdown()
+}
+
+// XattrStore defines a type that handles locally stored xattr
+// values by interacting with a BlockMetadataStore.
+type XattrStore interface {
+	// GetXattr looks for and returns the Xattr value of xattrType for blockID
+	// if it's found, and an error whose Cause is ldberrors.ErrNotFound if it's
+	// not found.
+	GetXattr(ctx context.Context,
+		blockID kbfsblock.ID, xattrType XattrType) ([]byte, error)
+	// SetXattr sets xattrType Xattr to xattrValue for blockID.
+	SetXattr(ctx context.Context,
+		blockID kbfsblock.ID, xattrType XattrType, xattrValue []byte) error
 }
 
 // cryptoPure contains all methods of Crypto that don't depend on
@@ -1556,18 +1681,18 @@ type Prefetcher interface {
 	// ProcessBlockForPrefetch potentially triggers and monitors a prefetch.
 	ProcessBlockForPrefetch(ctx context.Context, ptr BlockPointer, block Block,
 		kmd KeyMetadata, priority int, lifetime BlockCacheLifetime,
-		prefetchStatus PrefetchStatus)
+		prefetchStatus PrefetchStatus, action BlockRequestAction)
 	// WaitChannelForBlockPrefetch returns a channel that can be used
 	// to wait for a block to finish prefetching or be canceled.  If
 	// the block isn't currently being prefetched, it will return an
 	// already-closed channel.  When the channel is closed, the caller
 	// should still verify that the prefetch status of the block is
-	// `FinishedPrefetch`, in case there was an error.
+	// what they expect it to be, in case there was an error.
 	WaitChannelForBlockPrefetch(ctx context.Context, ptr BlockPointer) (
 		<-chan struct{}, error)
 	// CancelPrefetch notifies the prefetcher that a prefetch should be
 	// canceled.
-	CancelPrefetch(kbfsblock.ID)
+	CancelPrefetch(BlockPointer)
 	// Shutdown shuts down the prefetcher idempotently. Future calls to
 	// the various Prefetch* methods will return io.EOF. The returned channel
 	// allows upstream components to block until all pending prefetches are
@@ -1841,7 +1966,8 @@ type BlockServer interface {
 	// the block, and fills in the provided block object with its
 	// contents, if the logged-in user has read permission for that
 	// block.
-	Get(ctx context.Context, tlfID tlf.ID, id kbfsblock.ID, context kbfsblock.Context) (
+	Get(ctx context.Context, tlfID tlf.ID, id kbfsblock.ID,
+		context kbfsblock.Context, cacheType DiskBlockCacheType) (
 		[]byte, kbfscrypto.BlockCryptKeyServerHalf, error)
 
 	// GetEncodedSize gets the encoded size of the block associated
@@ -1864,13 +1990,17 @@ type BlockServer interface {
 	// If this returns a kbfsblock.ServerErrorOverQuota, with
 	// Throttled=false, the caller can treat it as informational
 	// and otherwise ignore the error.
-	Put(ctx context.Context, tlfID tlf.ID, id kbfsblock.ID, context kbfsblock.Context,
-		buf []byte, serverHalf kbfscrypto.BlockCryptKeyServerHalf) error
+	Put(ctx context.Context, tlfID tlf.ID, id kbfsblock.ID,
+		context kbfsblock.Context, buf []byte,
+		serverHalf kbfscrypto.BlockCryptKeyServerHalf,
+		cacheType DiskBlockCacheType) error
 
 	// PutAgain re-stores a previously deleted block under the same ID
 	// with the same data.
-	PutAgain(ctx context.Context, tlfID tlf.ID, id kbfsblock.ID, context kbfsblock.Context,
-		buf []byte, serverHalf kbfscrypto.BlockCryptKeyServerHalf) error
+	PutAgain(ctx context.Context, tlfID tlf.ID, id kbfsblock.ID,
+		context kbfsblock.Context, buf []byte,
+		serverHalf kbfscrypto.BlockCryptKeyServerHalf,
+		cacheType DiskBlockCacheType) error
 
 	// AddBlockReference adds a new reference to the given block,
 	// defined by the given context (which should contain a
@@ -2081,6 +2211,9 @@ type InitMode interface {
 	BlockWorkers() int
 	// PrefetchWorkers returns the number of prefetch workers to run.
 	PrefetchWorkers() int
+	// DefaultBlockRequestAction returns the action to be used by
+	// default whenever fetching a block.
+	DefaultBlockRequestAction() BlockRequestAction
 	// RekeyWorkers returns the number of rekey workers to run.
 	RekeyWorkers() int
 	// RekeyQueueSize returns the size of the rekey queue.
@@ -2139,6 +2272,12 @@ type InitMode interface {
 	// ClientType indicates the type we should advertise to the
 	// Keybase service.
 	ClientType() keybase1.ClientType
+	// LocalHTTPServerEnabled represents whether we should launch an HTTP
+	// server.
+	LocalHTTPServerEnabled() bool
+	// MaxCleanBlockCacheCapacity is the maximum number of bytes to be taken up
+	// by the clean block cache.
+	MaxCleanBlockCacheCapacity() uint64
 }
 
 type initModeGetter interface {
@@ -2179,6 +2318,7 @@ type Config interface {
 	diskMDCacheSetter
 	diskQuotaCacheGetter
 	diskQuotaCacheSetter
+	blockMetadataStoreGetSeter
 	clockGetter
 	diskLimiterGetter
 	syncedTlfGetterSetter
@@ -2480,13 +2620,11 @@ type RekeyFSM interface {
 
 // BlockRetriever specifies how to retrieve blocks.
 type BlockRetriever interface {
-	// Request retrieves blocks asynchronously.
+	// Request retrieves blocks asynchronously.  `action` determines
+	// what happens after the block is fetched successfully.
 	Request(ctx context.Context, priority int, kmd KeyMetadata,
-		ptr BlockPointer, block Block, lifetime BlockCacheLifetime) <-chan error
-	// RequestNoPrefetch retrieves blocks asynchronously, but doesn't trigger a
-	// prefetch unless the block had to be retrieved from the server.
-	RequestNoPrefetch(ctx context.Context, priority int, kmd KeyMetadata,
-		ptr BlockPointer, block Block, lifetime BlockCacheLifetime) <-chan error
+		ptr BlockPointer, block Block, lifetime BlockCacheLifetime,
+		action BlockRequestAction) <-chan error
 	// PutInCaches puts the block into the in-memory cache, and ensures that
 	// the disk cache metadata is updated.
 	PutInCaches(ctx context.Context, ptr BlockPointer, tlfID tlf.ID,
@@ -2544,4 +2682,24 @@ type Chat interface {
 	// ClearCache is called to force this instance to forget
 	// everything it might have cached, e.g. when a user logs out.
 	ClearCache()
+}
+
+type blockPutState interface {
+	addNewBlock(
+		ctx context.Context, blockPtr BlockPointer, block Block,
+		readyBlockData ReadyBlockData, syncedCb func() error) error
+	saveOldPtr(ctx context.Context, oldPtr BlockPointer) error
+	oldPtr(ctx context.Context, blockPtr BlockPointer) (BlockPointer, error)
+	mergeOtherBps(ctx context.Context, other blockPutState) error
+	removeOtherBps(ctx context.Context, other blockPutState) error
+	ptrs() []BlockPointer
+	getBlock(ctx context.Context, blockPtr BlockPointer) (Block, error)
+	getReadyBlockData(
+		ctx context.Context, blockPtr BlockPointer) (ReadyBlockData, error)
+	synced(blockPtr BlockPointer) error
+	numBlocks() int
+	deepCopy(ctx context.Context) (blockPutState, error)
+	deepCopyWithBlacklist(
+		ctx context.Context, blacklist map[BlockPointer]bool) (
+		blockPutState, error)
 }

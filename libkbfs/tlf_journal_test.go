@@ -74,6 +74,7 @@ func (d testBWDelegate) requireNextState(
 type testTLFJournalConfig struct {
 	codecGetter
 	logMaker
+	*testSyncedTlfGetterSetter
 	t            *testing.T
 	tlfID        tlf.ID
 	splitter     BlockSplitter
@@ -236,7 +237,8 @@ func setupTLFJournalTest(
 	require.NoError(t, err)
 
 	config = &testTLFJournalConfig{
-		newTestCodecGetter(), newTestLogMaker(t), t,
+		newTestCodecGetter(), newTestLogMaker(t),
+		newTestSyncedTlfGetterSetter(), t,
 		tlf.FakeID(1, tlf.Private), bsplitter, crypto,
 		nil, nil, NewMDCacheStandard(10), ver,
 		NewReporterSimple(newTestClockNow(), 10), uid, verifyingKey, ekg, nil,
@@ -396,8 +398,10 @@ type hangingBlockServer struct {
 }
 
 func (bs hangingBlockServer) Put(
-	ctx context.Context, tlfID tlf.ID, id kbfsblock.ID, context kbfsblock.Context,
-	buf []byte, serverHalf kbfscrypto.BlockCryptKeyServerHalf) error {
+	ctx context.Context, tlfID tlf.ID, id kbfsblock.ID,
+	context kbfsblock.Context,
+	buf []byte, serverHalf kbfscrypto.BlockCryptKeyServerHalf,
+	_ DiskBlockCacheType) error {
 	close(bs.onPutCh)
 	// Hang until the context is cancelled.
 	<-ctx.Done()
@@ -1029,8 +1033,10 @@ type orderedBlockServer struct {
 }
 
 func (s *orderedBlockServer) Put(
-	ctx context.Context, tlfID tlf.ID, id kbfsblock.ID, context kbfsblock.Context,
-	buf []byte, serverHalf kbfscrypto.BlockCryptKeyServerHalf) error {
+	ctx context.Context, tlfID tlf.ID, id kbfsblock.ID,
+	context kbfsblock.Context,
+	buf []byte, serverHalf kbfscrypto.BlockCryptKeyServerHalf,
+	_ DiskBlockCacheType) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	*s.puts = append(*s.puts, id)
@@ -1682,12 +1688,17 @@ func testTLFJournalResolveBranch(t *testing.T, ver kbfsmd.MetadataVer) {
 	require.Equal(t, firstRevision, maxMD)
 	// 3 blocks, 3 old MD markers, 1 new MD marker
 	require.Equal(t, 7, blocks.length())
-	require.Len(t, blocks.puts.blockStates, 2)
-	require.Len(t, blocks.adds.blockStates, 0)
+	require.Equal(t, 2, blocks.puts.numBlocks())
+	require.Equal(t, 0, blocks.adds.numBlocks())
 	// 1 ignored block, 3 ignored MD markers, 1 real MD marker
 	require.Len(t, blocks.other, 5)
-	require.Equal(t, bids[0], blocks.puts.blockStates[0].blockPtr.ID)
-	require.Equal(t, bids[2], blocks.puts.blockStates[1].blockPtr.ID)
+	ptrs := blocks.puts.ptrs()
+	ids := make([]kbfsblock.ID, len(ptrs))
+	for i, ptr := range ptrs {
+		ids[i] = ptr.ID
+	}
+	require.Contains(t, ids, bids[0])
+	require.Contains(t, ids, bids[2])
 	// 2 bytes of data in 2 unignored blocks.
 	require.Equal(t, int64(2), b)
 

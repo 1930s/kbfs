@@ -37,6 +37,9 @@ const (
 	// InitConstrainedString is for when KBFS will use constrained
 	// resources.
 	InitConstrainedString = "constrained"
+	// InitMemoryLimitedString is for when KBFS will use memory limited
+	// resources.
+	InitMemoryLimitedString = "memoryLimited"
 )
 
 // AdditionalProtocolCreator creates an additional protocol.
@@ -288,8 +291,9 @@ func AddFlagsWithDefaults(
 		"Encryption version to use when encrypting new blocks")
 	flags.StringVar(&params.Mode, "mode", defaultParams.Mode,
 		fmt.Sprintf("Overall initialization mode for KBFS, indicating how "+
-			"heavy-weight it can be (%s, %s, %s or %s)", InitDefaultString,
-			InitMinimalString, InitSingleOpString, InitConstrainedString))
+			"heavy-weight it can be (%s, %s, %s, %s or %s)", InitDefaultString,
+			InitMinimalString, InitSingleOpString, InitConstrainedString,
+			InitMemoryLimitedString))
 
 	flags.Float64Var((*float64)(&params.DiskBlockCacheFraction),
 		"disk-block-cache-fraction", defaultParams.DiskBlockCacheFraction,
@@ -594,6 +598,9 @@ func doInit(
 	case InitConstrainedString:
 		log.CDebugf(ctx, "Initializing in constrained mode")
 		mode = InitConstrained
+	case InitMemoryLimitedString:
+		log.CDebugf(ctx, "Initializing in memoryLimited mode")
+		mode = InitMemoryLimited
 	default:
 		return nil, fmt.Errorf("Unexpected mode: %s", params.Mode)
 	}
@@ -689,6 +696,8 @@ func doInit(
 	}
 	config.SetKeybaseService(service)
 
+	kbfsOps.favs.Initialize(ctx)
+
 	config.SetReporter(NewReporterKBPKI(config, 10, 1000))
 
 	// Initialize Crypto client (needed for MD and Block servers).
@@ -705,6 +714,10 @@ func doInit(
 		return nil, fmt.Errorf("problem creating MD server: %+v", err)
 	}
 	config.SetMDServer(mdServer)
+
+	// Must do this after setting the md server, since it depends on
+	// being able to fetch MDs.
+	go kbfsOps.initSyncedTlfs()
 
 	// Initialize KeyServer connection.  MDServer is the KeyServer at the
 	// moment.
@@ -770,6 +783,24 @@ func doInit(
 	} else {
 		log.CDebugf(ctx, "Disk quota cache enabled")
 	}
+
+	err = config.MakeBlockMetadataStoreIfNotExists()
+	if err != nil {
+		log.CWarningf(ctx,
+			"Could not initialize block metadata store: %+v", err)
+		return nil, err
+		// TODO (KBFS-3659): when we can open levelDB read-only, re-enable
+		//                   this, instead of failing the init.
+		/*
+			notification := &keybase1.FSNotification{
+				StatusCode:       keybase1.FSStatusCode_ERROR,
+				NotificationType: keybase1.FSNotificationType_INITIALIZED,
+				ErrorType:        keybase1.FSErrorType_DISK_CACHE_ERROR_LOG_SEND,
+			}
+			defer config.Reporter().Notify(ctx, notification)
+		*/
+	}
+	log.CDebugf(ctx, "Disk block metadata store cache enabled")
 
 	if config.Mode().KBFSServiceEnabled() {
 		// Initialize kbfsService only when we run a full KBFS process.

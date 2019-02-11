@@ -16,7 +16,9 @@ import (
 	kbname "github.com/keybase/client/go/kbun"
 	"github.com/keybase/client/go/libkb"
 	"github.com/keybase/client/go/protocol/keybase1"
+	"github.com/keybase/go-codec/codec"
 	"github.com/keybase/kbfs/kbfsblock"
+	"github.com/keybase/kbfs/kbfscodec"
 	"github.com/keybase/kbfs/kbfscrypto"
 	"github.com/keybase/kbfs/kbfsmd"
 	kbgitkbfs "github.com/keybase/kbfs/protocol/kbgitkbfs1"
@@ -795,6 +797,9 @@ const (
 	// InitConstrained is a mode where KBFS reads and writes data, but
 	// constrains itself to using fewer resources (e.g. on mobile).
 	InitConstrained
+	// InitMemoryLimited is a mode where KBFS reads and writes data, but
+	// constrains its memory use even further.
+	InitMemoryLimited
 )
 
 func (im InitModeType) String() string {
@@ -807,6 +812,8 @@ func (im InitModeType) String() string {
 		return InitSingleOpString
 	case InitConstrained:
 		return InitConstrainedString
+	case InitMemoryLimited:
+		return InitMemoryLimitedString
 	default:
 		return "unknown"
 	}
@@ -890,4 +897,228 @@ func PrefetchStatusFromProtocol(
 		panic("Invalid prefetch status from protocol")
 	}
 	return s
+}
+
+// FolderSyncEncryptedPartialPaths describes an encrypted block
+// containing the paths of a partial sync config.
+type FolderSyncEncryptedPartialPaths struct {
+	Ptr        BlockPointer
+	Buf        []byte
+	ServerHalf kbfscrypto.BlockCryptKeyServerHalf
+}
+
+// FolderSyncConfig is the on-disk representation for a TLF sync
+// config.
+type FolderSyncConfig struct {
+	Mode  keybase1.FolderSyncMode         `codec:"mode" json:"mode"`
+	Paths FolderSyncEncryptedPartialPaths `codec:"paths" json:"paths"`
+}
+
+type syncPathList struct {
+	// Paths is a list of files and directories within a TLF that are
+	// configured to be synced to the local device.
+	Paths []string
+
+	codec.UnknownFieldSetHandler
+}
+
+func (spl syncPathList) makeBlock(codec kbfscodec.Codec) (Block, error) {
+	buf, err := codec.Encode(spl)
+	if err != nil {
+		return nil, err
+	}
+	b := NewFileBlock().(*FileBlock)
+	b.Contents = buf
+	return b, nil
+}
+
+func syncPathListFromBlock(codec kbfscodec.Codec, b *FileBlock) (
+	paths syncPathList, err error) {
+	err = codec.Decode(b.Contents, &paths)
+	if err != nil {
+		return syncPathList{}, err
+	}
+	return paths, nil
+}
+
+// BlockMetadataValue represents the value stored in the block metadata
+// store. This is usually locally stored, and is separate from block metadata
+// stored on bserver.
+type BlockMetadataValue struct {
+	// Xattr contains all xattrs stored in association with the block. This is
+	// useful for stuff that's contingent to content of the block, such as
+	// quarantine data.
+	Xattr map[XattrType][]byte
+}
+
+// BlockMetadataUpdater defines a function to update a BlockMetadataValue.
+type BlockMetadataUpdater func(*BlockMetadataValue) error
+
+// BlockRequestAction indicates what kind of action should be taken
+// after successfully fetching a block.  This is a bit mask filled
+// with `blockRequestFlag`s.
+type BlockRequestAction int
+
+const (
+	// These unexported actions are really flags that are combined to
+	// make the other actions below.
+	blockRequestTrackedInPrefetch BlockRequestAction = 1 << iota
+	blockRequestPrefetch
+	blockRequestSync
+	blockRequestStopIfFull
+	blockRequestDeepSync
+
+	// BlockRequestSolo indicates that no action should take place
+	// after fetching the block.  However, a TLF that is configured to
+	// be fully-synced will still be prefetched and synced.
+	BlockRequestSolo BlockRequestAction = 0
+	// BlockRequestSoloWithSync indicates the the requested block
+	// should be put in the sync cache, but no prefetching should be
+	// triggered.
+	BlockRequestSoloWithSync BlockRequestAction = blockRequestSync
+	// BlockRequestPrefetchTail indicates that the block is being
+	// tracked in the prefetcher, but shouldn't kick off any more
+	// prefetches.
+	BlockRequestPrefetchTail BlockRequestAction = blockRequestTrackedInPrefetch
+	// BlockRequestPrefetchTailWithSync indicates that the block is
+	// being tracked in the prefetcher and goes in the sync cache, but
+	// shouldn't kick off any more prefetches.
+	BlockRequestPrefetchTailWithSync BlockRequestAction = blockRequestTrackedInPrefetch | blockRequestSync
+	// BlockRequestWithPrefetch indicates that a prefetch should be
+	// triggered after fetching the block.  If a TLF is configured to
+	// be fully-synced, the block will still be put in the sync cache.
+	BlockRequestWithPrefetch BlockRequestAction = blockRequestTrackedInPrefetch | blockRequestPrefetch
+	// BlockRequestWithSyncAndPrefetch indicates that the block should
+	// be stored in the sync cache after fetching it, as well as
+	// triggering a prefetch of one level of child blocks (and the
+	// syncing doesn't propagate to the child blocks).
+	BlockRequestWithSyncAndPrefetch BlockRequestAction = blockRequestTrackedInPrefetch | blockRequestPrefetch | blockRequestSync
+	// BlockRequestPrefetchUntilFull prefetches starting from the
+	// given block (but does not sync the blocks) until the working
+	// set cache is full, and then it stops prefetching.
+	BlockRequestPrefetchUntilFull BlockRequestAction = blockRequestTrackedInPrefetch | blockRequestPrefetch | blockRequestStopIfFull
+	// BlockRequestWithDeepSync is the same as above, except both the
+	// prefetching and the sync flags propagate to the child, so the
+	// whole tree root at the block is prefetched and synced.
+	BlockRequestWithDeepSync BlockRequestAction = blockRequestTrackedInPrefetch | blockRequestPrefetch | blockRequestSync | blockRequestDeepSync
+)
+
+func (bra BlockRequestAction) String() string {
+	if bra.DeepSync() {
+		return "deep-sync"
+	}
+	if bra == BlockRequestSolo {
+		return "solo"
+	}
+
+	attrs := make([]string, 0, 3)
+	if bra.prefetch() {
+		attrs = append(attrs, "prefetch")
+	} else if bra.PrefetchTracked() {
+		attrs = append(attrs, "prefetch-tracked")
+	}
+
+	if bra.Sync() {
+		attrs = append(attrs, "sync")
+	}
+
+	if bra.StopIfFull() {
+		attrs = append(attrs, "stop-if-full")
+	}
+
+	return strings.Join(attrs, "|")
+}
+
+// Combine returns a new action by taking `other` into account.
+func (bra BlockRequestAction) Combine(
+	other BlockRequestAction) BlockRequestAction {
+	return bra | other
+}
+
+func (bra BlockRequestAction) prefetch() bool {
+	return bra&blockRequestPrefetch > 0
+}
+
+// Prefetch returns true if the action indicates the block should
+// trigger a prefetch.
+func (bra BlockRequestAction) Prefetch(block Block) bool {
+	// When syncing, always prefetch child blocks of an indirect
+	// block, since it makes no sense to sync just part of a
+	// multi-block object.
+	if block.IsIndirect() && bra.Sync() {
+		return true
+	}
+	return bra.prefetch()
+}
+
+// PrefetchTracked returns true if this block is being tracked by the
+// prefetcher.
+func (bra BlockRequestAction) PrefetchTracked() bool {
+	return bra.prefetch() || bra&blockRequestTrackedInPrefetch > 0
+}
+
+// Sync returns true if the action indicates the block should go into
+// the sync cache.
+func (bra BlockRequestAction) Sync() bool {
+	return bra&blockRequestSync > 0
+}
+
+// DeepSync returns true if the action indicates a deep-syncing of the
+// block tree rooted at the given block.
+func (bra BlockRequestAction) DeepSync() bool {
+	return bra == BlockRequestWithDeepSync
+}
+
+// DeepPrefetch returns true if the prefetcher should continue
+// prefetching the children of this block all the way to the leafs of
+// the tree.
+func (bra BlockRequestAction) DeepPrefetch() bool {
+	return bra.DeepSync() || bra == BlockRequestPrefetchUntilFull
+}
+
+// ChildAction returns the action that should propagate down to any
+// children of this block.
+func (bra BlockRequestAction) ChildAction(block Block) BlockRequestAction {
+	// When syncing, always prefetch child blocks of an indirect
+	// block, since it makes no sense to sync just part of a
+	// multi-block object.
+	if bra.DeepPrefetch() || (block.IsIndirect() && bra.Sync()) {
+		return bra
+	}
+	return bra &^ (blockRequestPrefetch | blockRequestSync)
+}
+
+// SoloAction returns a solo-fetch action based on `bra` (e.g.,
+// preserving the sync bit but nothing else).
+func (bra BlockRequestAction) SoloAction() BlockRequestAction {
+	return bra & blockRequestSync
+}
+
+// AddSync returns a new action that adds syncing in addition to the
+// original request.  For prefetch requests, it returns a deep-sync
+// request (unlike `Combine`, which just adds the regular sync bit).
+func (bra BlockRequestAction) AddSync() BlockRequestAction {
+	if bra.prefetch() {
+		return BlockRequestWithDeepSync
+	}
+	// If the prefetch bit is NOT yet set (as when some component
+	// makes a solo request, for example), we should not kick off a
+	// deep sync since the action explicit prohibits any more blocks
+	// being fetched (and doing so will mess up sensitive tests).
+	return bra | blockRequestSync
+}
+
+// CacheType returns the disk block cache type that should be used,
+// according to the type of action.
+func (bra BlockRequestAction) CacheType() DiskBlockCacheType {
+	if bra.Sync() {
+		return DiskBlockSyncCache
+	}
+	return DiskBlockAnyCache
+}
+
+// StopIfFull returns true if prefetching should stop for good (i.e.,
+// not get rescheduled) when the corresponding disk cache is full.
+func (bra BlockRequestAction) StopIfFull() bool {
+	return bra&blockRequestStopIfFull > 0
 }

@@ -48,7 +48,8 @@ func startMounting(ctx context.Context,
 	}
 
 	log.CDebugf(ctx, "Creating filesystem")
-	fs := NewFS(config, mounter.c, options.KbfsParams.Debug, options.PlatformParams)
+	fs := NewFS(config, mounter.c, options.KbfsParams.Debug,
+		options.PlatformParams)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	ctx = context.WithValue(ctx, libfs.CtxAppIDKey, fs)

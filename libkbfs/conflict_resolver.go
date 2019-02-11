@@ -644,7 +644,7 @@ func (cr *ConflictResolver) checkPathForMerge(ctx context.Context,
 		// stay the same, so we can still match the unmerged path
 		// correctly.
 		err := unmergedChains.changeOriginal(unmergedOriginal, mergedOriginal)
-		if _, notFound := err.(NoChainFoundError); notFound {
+		if _, notFound := errors.Cause(err).(NoChainFoundError); notFound {
 			unmergedChains.toUnrefPointers[unmergedOriginal] = true
 			continue
 		} else if err != nil {
@@ -901,7 +901,7 @@ func (cr *ConflictResolver) resolveMergedPathTail(ctx context.Context,
 				cr.log.CDebugf(ctx, "Couldn't find chain for original "+
 					"old parent: %v", ri.originalOldParent)
 				return path{}, BlockPointer{}, nil,
-					NoChainFoundError{ri.originalOldParent}
+					errors.WithStack(NoChainFoundError{ri.originalOldParent})
 			}
 			for _, op := range oldParent.ops {
 				ro, ok := op.(*rmOp)
@@ -921,7 +921,7 @@ func (cr *ConflictResolver) resolveMergedPathTail(ctx context.Context,
 				cr.log.CDebugf(ctx, "Couldn't find chain for original new "+
 					"parent: %v", ri.originalNewParent)
 				return path{}, BlockPointer{}, nil,
-					NoChainFoundError{ri.originalNewParent}
+					errors.WithStack(NoChainFoundError{ri.originalNewParent})
 			}
 			for i, op := range newParent.ops {
 				oldCo, ok := op.(*createOp)
@@ -2225,7 +2225,7 @@ type fileBlockMap map[BlockPointer]map[string]*FileBlock
 func (cr *ConflictResolver) makeFileBlockDeepCopy(ctx context.Context,
 	lState *lockState, chains *crChains, mergedMostRecent BlockPointer,
 	parentPath path, name string, ptr BlockPointer, blocks fileBlockMap,
-	dirtyBcache DirtyBlockCache) (BlockPointer, error) {
+	dirtyBcache DirtyBlockCacheSimple) (BlockPointer, error) {
 	kmd := chains.mostRecentChainMDInfo
 
 	file := parentPath.ChildPath(name, ptr)
@@ -2241,7 +2241,7 @@ func (cr *ConflictResolver) makeFileBlockDeepCopy(ctx context.Context,
 		return BlockPointer{}, err
 	}
 
-	block, err := dirtyBcache.Get(cr.fbo.id(), newPtr, cr.fbo.branch())
+	block, err := dirtyBcache.Get(ctx, cr.fbo.id(), newPtr, cr.fbo.branch())
 	if err != nil {
 		return BlockPointer{}, err
 	}
@@ -2286,7 +2286,7 @@ func (cr *ConflictResolver) doOneAction(
 	mergedPaths map[BlockPointer]path, chargedTo keybase1.UserOrTeamID,
 	actionMap map[BlockPointer]crActionList, lbc localBcache,
 	doneActions map[BlockPointer]bool, newFileBlocks fileBlockMap,
-	dirtyBcache DirtyBlockCache) error {
+	dirtyBcache DirtyBlockCacheSimple) error {
 	unmergedMostRecent := unmergedPath.tailPointer()
 	unmergedChain, ok :=
 		unmergedChains.byMostRecent[unmergedMostRecent]
@@ -2445,7 +2445,7 @@ func (cr *ConflictResolver) doActions(ctx context.Context,
 	lState *lockState, unmergedChains, mergedChains *crChains,
 	unmergedPaths []path, mergedPaths map[BlockPointer]path,
 	actionMap map[BlockPointer]crActionList, lbc localBcache,
-	newFileBlocks fileBlockMap, dirtyBcache DirtyBlockCache) error {
+	newFileBlocks fileBlockMap, dirtyBcache DirtyBlockCacheSimple) error {
 	mergedMD := mergedChains.mostRecentChainMDInfo
 	chargedTo, err := chargedToForTLF(
 		ctx, cr.config.KBPKI(), cr.config.KBPKI(), mergedMD.GetTlfHandle())
@@ -3008,7 +3008,7 @@ func (cr *ConflictResolver) finalizeResolution(ctx context.Context,
 	lState *lockState, md *RootMetadata,
 	unmergedChains, mergedChains *crChains,
 	updates map[BlockPointer]BlockPointer,
-	bps *blockPutState, blocksToDelete []kbfsblock.ID, writerLocked bool) error {
+	bps blockPutState, blocksToDelete []kbfsblock.ID, writerLocked bool) error {
 	err := cr.checkDone(ctx)
 	if err != nil {
 		return err
@@ -3042,8 +3042,8 @@ func (cr *ConflictResolver) completeResolution(ctx context.Context,
 	lState *lockState, unmergedChains, mergedChains *crChains,
 	unmergedPaths []path, mergedPaths map[BlockPointer]path,
 	mostRecentUnmergedMD, mostRecentMergedMD ImmutableRootMetadata,
-	lbc localBcache, newFileBlocks fileBlockMap, dirtyBcache DirtyBlockCache,
-	writerLocked bool) (err error) {
+	lbc localBcache, newFileBlocks fileBlockMap,
+	dirtyBcache DirtyBlockCacheSimple, writerLocked bool) (err error) {
 	md, err := cr.createResolvedMD(
 		ctx, lState, unmergedPaths, unmergedChains,
 		mergedChains, mostRecentMergedMD)
@@ -3118,9 +3118,14 @@ func (cr *ConflictResolver) completeResolution(ctx context.Context,
 	}
 
 	// Put all the blocks.  TODO: deal with recoverable block errors?
-	_, err = doBlockPuts(ctx, cr.config.BlockServer(), cr.config.BlockCache(),
+	cacheType := DiskBlockAnyCache
+	if cr.config.IsSyncedTlf(md.TlfID()) {
+		cacheType = DiskBlockSyncCache
+	}
+	_, err = doBlockPuts(
+		ctx, cr.config.BlockServer(), cr.config.BlockCache(),
 		cr.config.Reporter(), cr.log, cr.deferLog, md.TlfID(),
-		md.GetTlfHandle().GetCanonicalName(), *bps)
+		md.GetTlfHandle().GetCanonicalName(), bps, cacheType)
 	if err != nil {
 		return err
 	}

@@ -8,6 +8,8 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/keybase/client/go/protocol/keybase1"
 	"github.com/keybase/go-codec/codec"
 	"github.com/keybase/kbfs/env"
+	"github.com/keybase/kbfs/ioutil"
 	"github.com/keybase/kbfs/kbfsblock"
 	"github.com/keybase/kbfs/kbfscodec"
 	"github.com/keybase/kbfs/kbfscrypto"
@@ -129,13 +132,17 @@ func kbfsOpsInit(t *testing.T) (mockCtrl *gomock.Controller,
 		newTestSyncedTlfGetterSetter(), testInitModeGetter{InitDefault}}
 	brq := newBlockRetrievalQueue(0, 0, brc)
 	config.mockBops.EXPECT().BlockRetriever().AnyTimes().Return(brq)
-	// Ignore Prefetcher calls
-	pre := newBlockPrefetcher(brq, brc, nil)
-	config.mockBops.EXPECT().Prefetcher().AnyTimes().Return(pre)
+	config.mockBops.EXPECT().Prefetcher().AnyTimes().Return(brq.prefetcher)
 
 	// Ignore favorites
+	err := errors.New("Fake error to prevent trying to read favs from disk")
+	config.mockKbpki.EXPECT().GetCurrentSession(gomock.Any()).Return(
+		SessionInfo{}, err)
+	kbfsops.favs.Initialize(ctx)
 	config.mockKbpki.EXPECT().FavoriteList(gomock.Any()).AnyTimes().
 		Return(nil, nil)
+	config.mockKbs.EXPECT().EncryptFavorites(gomock.Any(), gomock.Any()).
+		AnyTimes().Return(nil, nil)
 	config.mockKbpki.EXPECT().FavoriteAdd(gomock.Any(), gomock.Any()).
 		AnyTimes().Return(nil)
 
@@ -153,7 +160,7 @@ func kbfsOpsInit(t *testing.T) (mockCtrl *gomock.Controller,
 	// make the context identifiable, to verify that it is passed
 	// correctly to the observer
 	id := rand.Int()
-	ctx, err := NewContextWithCancellationDelayer(NewContextReplayable(
+	ctx, err = NewContextWithCancellationDelayer(NewContextReplayable(
 		timeoutCtx, func(ctx context.Context) context.Context {
 			return context.WithValue(ctx, tCtxID, id)
 		}))
@@ -178,6 +185,7 @@ func kbfsTestShutdown(mockCtrl *gomock.Controller, config *ConfigMock,
 	if err := CleanupCancellationDelayer(ctx); err != nil {
 		panic(err)
 	}
+	config.mockBops.Prefetcher().Shutdown()
 	mockCtrl.Finish()
 }
 
@@ -244,7 +252,8 @@ func kbfsTestShutdownNoMocksNoCheck(t *testing.T, config *ConfigLocal,
 	CleanupCancellationDelayer(ctx)
 }
 
-func checkBlockCache(t *testing.T, config *ConfigMock, id tlf.ID,
+func checkBlockCache(
+	t *testing.T, ctx context.Context, config *ConfigMock, id tlf.ID,
 	expectedCleanBlocks []kbfsblock.ID,
 	expectedDirtyBlocks map[BlockPointer]BranchName) {
 	bcache := config.BlockCache().(*BlockCacheStandard)
@@ -264,7 +273,7 @@ func checkBlockCache(t *testing.T, config *ConfigMock, id tlf.ID,
 	// dirty blocks
 	dirtyBcache := config.DirtyBlockCache().(*DirtyBlockCacheStandard)
 	for ptr, branch := range expectedDirtyBlocks {
-		_, err := dirtyBcache.Get(id, ptr, branch)
+		_, err := dirtyBcache.Get(ctx, id, ptr, branch)
 		if err != nil {
 			t.Errorf("BlockCache missing dirty block %v, branch %s at "+
 				"the end of the test: err %+v", ptr, branch, err)
@@ -1135,9 +1144,11 @@ func TestKBFSOpsStatSuccess(t *testing.T) {
 	}
 }
 
-func getBlockFromCache(t *testing.T, config Config, id tlf.ID, ptr BlockPointer,
-	branch BranchName) Block {
-	if block, err := config.DirtyBlockCache().Get(id, ptr, branch); err == nil {
+func getBlockFromCache(
+	t *testing.T, ctx context.Context, config Config, id tlf.ID,
+	ptr BlockPointer, branch BranchName) Block {
+	if block, err := config.DirtyBlockCache().Get(
+		ctx, id, ptr, branch); err == nil {
 		return block
 	}
 	block, err := config.BlockCache().Get(ptr)
@@ -1149,9 +1160,10 @@ func getBlockFromCache(t *testing.T, config Config, id tlf.ID, ptr BlockPointer,
 	return block
 }
 
-func getDirBlockFromCache(t *testing.T, config Config, id tlf.ID,
+func getDirBlockFromCache(
+	t *testing.T, ctx context.Context, config Config, id tlf.ID,
 	ptr BlockPointer, branch BranchName) *DirBlock {
-	block := getBlockFromCache(t, config, id, ptr, branch)
+	block := getBlockFromCache(t, ctx, config, id, ptr, branch)
 	dblock, ok := block.(*DirBlock)
 	if !ok {
 		t.Errorf("Cached block %v, branch %s was not a DirBlock", ptr, branch)
@@ -1159,9 +1171,10 @@ func getDirBlockFromCache(t *testing.T, config Config, id tlf.ID,
 	return dblock
 }
 
-func getFileBlockFromCache(t *testing.T, config Config, id tlf.ID,
+func getFileBlockFromCache(
+	t *testing.T, ctx context.Context, config Config, id tlf.ID,
 	ptr BlockPointer, branch BranchName) *FileBlock {
-	block := getBlockFromCache(t, config, id, ptr, branch)
+	block := getBlockFromCache(t, ctx, config, id, ptr, branch)
 	fblock, ok := block.(*FileBlock)
 	if !ok {
 		t.Errorf("Cached block %v, branch %s was not a FileBlock", ptr, branch)
@@ -1886,10 +1899,11 @@ func TestKBFSOpsWriteNewBlockSuccess(t *testing.T) {
 		t.Errorf("Got error on write: %+v", err)
 	}
 
-	newFileBlock := getFileBlockFromCache(t, config, id, fileNode.BlockPointer,
+	newFileBlock := getFileBlockFromCache(
+		t, ctx, config, id, fileNode.BlockPointer,
 		p.Branch)
 	newRootBlock := getDirBlockFromCache(
-		t, config, id, node.BlockPointer, p.Branch)
+		t, ctx, config, id, node.BlockPointer, p.Branch)
 
 	if len(ops.nodeCache.PathFromNode(config.observer.localChange).path) !=
 		len(p.path) {
@@ -1907,7 +1921,8 @@ func TestKBFSOpsWriteNewBlockSuccess(t *testing.T) {
 		t.Errorf("Wrong size for written file: %d",
 			newRootBlock.Children["f"].Size)
 	}
-	checkBlockCache(t, config, id, []kbfsblock.ID{rootID, fileID},
+	checkBlockCache(
+		t, ctx, config, id, []kbfsblock.ID{rootID, fileID},
 		map[BlockPointer]BranchName{
 			node.BlockPointer:     p.Branch,
 			fileNode.BlockPointer: p.Branch,
@@ -1956,8 +1971,8 @@ func TestKBFSOpsWriteExtendSuccess(t *testing.T) {
 		t.Errorf("Got error on write: %+v", err)
 	}
 
-	newFileBlock := getFileBlockFromCache(t, config, id, fileNode.BlockPointer,
-		p.Branch)
+	newFileBlock := getFileBlockFromCache(
+		t, ctx, config, id, fileNode.BlockPointer, p.Branch)
 
 	if len(ops.nodeCache.PathFromNode(config.observer.localChange).path) !=
 		len(p.path) {
@@ -1969,7 +1984,8 @@ func TestKBFSOpsWriteExtendSuccess(t *testing.T) {
 	} else if !bytes.Equal(expectedFullData, newFileBlock.Contents) {
 		t.Errorf("Wrote bad contents: %v", data)
 	}
-	checkBlockCache(t, config, id, []kbfsblock.ID{rootID, fileID},
+	checkBlockCache(
+		t, ctx, config, id, []kbfsblock.ID{rootID, fileID},
 		map[BlockPointer]BranchName{
 			node.BlockPointer:     p.Branch,
 			fileNode.BlockPointer: p.Branch,
@@ -2018,8 +2034,8 @@ func TestKBFSOpsWritePastEndSuccess(t *testing.T) {
 		t.Errorf("Got error on write: %+v", err)
 	}
 
-	newFileBlock := getFileBlockFromCache(t, config, id, fileNode.BlockPointer,
-		p.Branch)
+	newFileBlock := getFileBlockFromCache(
+		t, ctx, config, id, fileNode.BlockPointer, p.Branch)
 
 	if len(ops.nodeCache.PathFromNode(config.observer.localChange).path) !=
 		len(p.path) {
@@ -2031,7 +2047,8 @@ func TestKBFSOpsWritePastEndSuccess(t *testing.T) {
 	} else if !bytes.Equal(expectedFullData, newFileBlock.Contents) {
 		t.Errorf("Wrote bad contents: %v", data)
 	}
-	checkBlockCache(t, config, id, []kbfsblock.ID{rootID, fileID},
+	checkBlockCache(
+		t, ctx, config, id, []kbfsblock.ID{rootID, fileID},
 		map[BlockPointer]BranchName{
 			node.BlockPointer:     p.Branch,
 			fileNode.BlockPointer: p.Branch,
@@ -2096,15 +2113,16 @@ func TestKBFSOpsWriteCauseSplit(t *testing.T) {
 	if err := config.KBFSOps().Write(ctx, n, newData, 1); err != nil {
 		t.Errorf("Got error on write: %+v", err)
 	}
-	b, _ := config.DirtyBlockCache().Get(id, node.BlockPointer, p.Branch)
+	b, _ := config.DirtyBlockCache().Get(ctx, id, node.BlockPointer, p.Branch)
 	newRootBlock := b.(*DirBlock)
 
-	b, _ = config.DirtyBlockCache().Get(id, fileNode.BlockPointer, p.Branch)
+	b, _ = config.DirtyBlockCache().Get(
+		ctx, id, fileNode.BlockPointer, p.Branch)
 	pblock := b.(*FileBlock)
-	b, _ = config.DirtyBlockCache().Get(id, makeBP(id1, rmd, config, uid),
+	b, _ = config.DirtyBlockCache().Get(ctx, id, makeBP(id1, rmd, config, uid),
 		p.Branch)
 	block1 := b.(*FileBlock)
-	b, _ = config.DirtyBlockCache().Get(id, makeBP(id2, rmd, config, uid),
+	b, _ = config.DirtyBlockCache().Get(ctx, id, makeBP(id2, rmd, config, uid),
 		p.Branch)
 	block2 := b.(*FileBlock)
 
@@ -2140,7 +2158,8 @@ func TestKBFSOpsWriteCauseSplit(t *testing.T) {
 			newRootBlock.Children["f"].Size)
 	}
 
-	checkBlockCache(t, config, id, []kbfsblock.ID{rootID, fileID},
+	checkBlockCache(
+		t, ctx, config, id, []kbfsblock.ID{rootID, fileID},
 		map[BlockPointer]BranchName{
 			node.BlockPointer:            p.Branch,
 			fileNode.BlockPointer:        p.Branch,
@@ -2211,10 +2230,11 @@ func TestKBFSOpsWriteOverMultipleBlocks(t *testing.T) {
 
 	// only copy the first half first
 	config.mockBsplit.EXPECT().CopyUntilSplit(
-		//		gomock.Any(), gomock.Any(), data, int64(2)).
 		gomock.Any(), gomock.Any(), []byte{1, 2, 3}, int64(2)).
 		Do(func(block *FileBlock, lb bool, data []byte, off int64) {
-			block.Contents = append(block1.Contents[0:2], data[0:3]...)
+			block.Contents = make([]byte, 5)
+			copy(block.Contents, block1.Contents[0:2])
+			copy(block.Contents[2:], data[0:3])
 		}).Return(int64(3))
 
 	// update block 2
@@ -2228,10 +2248,10 @@ func TestKBFSOpsWriteOverMultipleBlocks(t *testing.T) {
 		t.Errorf("Got error on write: %+v", err)
 	}
 
-	newBlock1 := getFileBlockFromCache(t, config, id,
-		fileBlock.IPtrs[0].BlockPointer, p.Branch)
-	newBlock2 := getFileBlockFromCache(t, config, id,
-		fileBlock.IPtrs[1].BlockPointer, p.Branch)
+	newBlock1 := getFileBlockFromCache(
+		t, ctx, config, id, fileBlock.IPtrs[0].BlockPointer, p.Branch)
+	newBlock2 := getFileBlockFromCache(
+		t, ctx, config, id, fileBlock.IPtrs[1].BlockPointer, p.Branch)
 
 	if len(ops.nodeCache.PathFromNode(config.observer.localChange).path) !=
 		len(p.path) {
@@ -2252,7 +2272,8 @@ func TestKBFSOpsWriteOverMultipleBlocks(t *testing.T) {
 	checkSyncOpInCache(t, config.Codec(), ops, fileNode.BlockPointer,
 		[]WriteRange{{Off: 2, Len: uint64(len(data))}})
 	mergeUnrefCache(ops, lState, p, rmd)
-	checkBlockCache(t, config, id, []kbfsblock.ID{rootID, fileID, id1, id2},
+	checkBlockCache(
+		t, ctx, config, id, []kbfsblock.ID{rootID, fileID, id1, id2},
 		map[BlockPointer]BranchName{
 			node.BlockPointer:               p.Branch,
 			fileNode.BlockPointer:           p.Branch,
@@ -2298,10 +2319,10 @@ func TestKBFSOpsTruncateToZeroSuccess(t *testing.T) {
 		t.Errorf("Got error on truncate: %+v", err)
 	}
 
-	newFileBlock := getFileBlockFromCache(t, config, id, fileNode.BlockPointer,
-		p.Branch)
+	newFileBlock := getFileBlockFromCache(
+		t, ctx, config, id, fileNode.BlockPointer, p.Branch)
 	newRootBlock := getDirBlockFromCache(
-		t, config, id, node.BlockPointer, p.Branch)
+		t, ctx, config, id, node.BlockPointer, p.Branch)
 
 	if len(ops.nodeCache.PathFromNode(config.observer.localChange).path) !=
 		len(p.path) {
@@ -2319,7 +2340,8 @@ func TestKBFSOpsTruncateToZeroSuccess(t *testing.T) {
 		t.Errorf("Wrong size for written file: %d",
 			newRootBlock.Children["f"].Size)
 	}
-	checkBlockCache(t, config, id, []kbfsblock.ID{rootID, fileID},
+	checkBlockCache(
+		t, ctx, config, id, []kbfsblock.ID{rootID, fileID},
 		map[BlockPointer]BranchName{
 			node.BlockPointer:     p.Branch,
 			fileNode.BlockPointer: p.Branch,
@@ -2363,7 +2385,7 @@ func TestKBFSOpsTruncateSameSize(t *testing.T) {
 	} else if !bytes.Equal(data, fileBlock.Contents) {
 		t.Errorf("Wrote bad contents: %v", data)
 	}
-	checkBlockCache(t, config, id, []kbfsblock.ID{rootID, fileID}, nil)
+	checkBlockCache(t, ctx, config, id, []kbfsblock.ID{rootID, fileID}, nil)
 }
 
 func TestKBFSOpsTruncateSmallerSuccess(t *testing.T) {
@@ -2400,8 +2422,8 @@ func TestKBFSOpsTruncateSmallerSuccess(t *testing.T) {
 		t.Errorf("Got error on truncate: %+v", err)
 	}
 
-	newFileBlock := getFileBlockFromCache(t, config, id, fileNode.BlockPointer,
-		p.Branch)
+	newFileBlock := getFileBlockFromCache(
+		t, ctx, config, id, fileNode.BlockPointer, p.Branch)
 
 	if len(ops.nodeCache.PathFromNode(config.observer.localChange).path) !=
 		len(p.path) {
@@ -2413,7 +2435,8 @@ func TestKBFSOpsTruncateSmallerSuccess(t *testing.T) {
 	} else if !bytes.Equal(data, newFileBlock.Contents) {
 		t.Errorf("Wrote bad contents: %v", data)
 	}
-	checkBlockCache(t, config, id, []kbfsblock.ID{rootID, fileID},
+	checkBlockCache(
+		t, ctx, config, id, []kbfsblock.ID{rootID, fileID},
 		map[BlockPointer]BranchName{
 			node.BlockPointer:     p.Branch,
 			fileNode.BlockPointer: p.Branch,
@@ -2469,12 +2492,12 @@ func TestKBFSOpsTruncateShortensLastBlock(t *testing.T) {
 		t.Errorf("Got error on truncate: %+v", err)
 	}
 
-	newPBlock := getFileBlockFromCache(t, config, id, fileNode.BlockPointer,
-		p.Branch)
-	newBlock1 := getFileBlockFromCache(t, config, id,
-		fileBlock.IPtrs[0].BlockPointer, p.Branch)
-	newBlock2 := getFileBlockFromCache(t, config, id,
-		fileBlock.IPtrs[1].BlockPointer, p.Branch)
+	newPBlock := getFileBlockFromCache(
+		t, ctx, config, id, fileNode.BlockPointer, p.Branch)
+	newBlock1 := getFileBlockFromCache(
+		t, ctx, config, id, fileBlock.IPtrs[0].BlockPointer, p.Branch)
+	newBlock2 := getFileBlockFromCache(
+		t, ctx, config, id, fileBlock.IPtrs[1].BlockPointer, p.Branch)
 
 	lState := makeFBOLockState()
 
@@ -2501,7 +2524,8 @@ func TestKBFSOpsTruncateShortensLastBlock(t *testing.T) {
 		t.Errorf("Truncated block not correctly unref'd, unrefBytes = %d",
 			rmd.UnrefBytes())
 	}
-	checkBlockCache(t, config, id, []kbfsblock.ID{rootID, fileID, id1, id2},
+	checkBlockCache(
+		t, ctx, config, id, []kbfsblock.ID{rootID, fileID, id1, id2},
 		map[BlockPointer]BranchName{
 			node.BlockPointer:               p.Branch,
 			fileNode.BlockPointer:           p.Branch,
@@ -2556,10 +2580,10 @@ func TestKBFSOpsTruncateRemovesABlock(t *testing.T) {
 		t.Errorf("Got error on truncate: %+v", err)
 	}
 
-	newPBlock := getFileBlockFromCache(t, config, id, fileNode.BlockPointer,
-		p.Branch)
-	newBlock1 := getFileBlockFromCache(t, config, id,
-		fileBlock.IPtrs[0].BlockPointer, p.Branch)
+	newPBlock := getFileBlockFromCache(
+		t, ctx, config, id, fileNode.BlockPointer, p.Branch)
+	newBlock1 := getFileBlockFromCache(
+		t, ctx, config, id, fileBlock.IPtrs[0].BlockPointer, p.Branch)
 
 	lState := makeFBOLockState()
 
@@ -2584,7 +2608,8 @@ func TestKBFSOpsTruncateRemovesABlock(t *testing.T) {
 		t.Errorf("Truncated block not correctly unref'd, unrefBytes = %d",
 			rmd.UnrefBytes())
 	}
-	checkBlockCache(t, config, id, []kbfsblock.ID{rootID, fileID, id1, id2},
+	checkBlockCache(
+		t, ctx, config, id, []kbfsblock.ID{rootID, fileID, id1, id2},
 		map[BlockPointer]BranchName{
 			node.BlockPointer:               p.Branch,
 			fileNode.BlockPointer:           p.Branch,
@@ -2631,8 +2656,8 @@ func TestKBFSOpsTruncateBiggerSuccess(t *testing.T) {
 		t.Errorf("Got error on truncate: %+v", err)
 	}
 
-	newFileBlock := getFileBlockFromCache(t, config, id, fileNode.BlockPointer,
-		p.Branch)
+	newFileBlock := getFileBlockFromCache(
+		t, ctx, config, id, fileNode.BlockPointer, p.Branch)
 
 	if len(ops.nodeCache.PathFromNode(config.observer.localChange).path) !=
 		len(p.path) {
@@ -2644,7 +2669,8 @@ func TestKBFSOpsTruncateBiggerSuccess(t *testing.T) {
 	} else if !bytes.Equal(data, newFileBlock.Contents) {
 		t.Errorf("Wrote bad contents: %v", data)
 	}
-	checkBlockCache(t, config, id, []kbfsblock.ID{rootID, fileID},
+	checkBlockCache(
+		t, ctx, config, id, []kbfsblock.ID{rootID, fileID},
 		map[BlockPointer]BranchName{
 			node.BlockPointer:     p.Branch,
 			fileNode.BlockPointer: p.Branch,
@@ -2716,7 +2742,7 @@ func TestSetMtimeNull(t *testing.T) {
 	} else if newP.path[0].ID != p.path[0].ID {
 		t.Errorf("Got back a changed path for null setmtime test: %v", newP)
 	}
-	checkBlockCache(t, config, id, nil, nil)
+	checkBlockCache(t, ctx, config, id, nil, nil)
 }
 
 func TestMtimeFailNoSuchName(t *testing.T) {
@@ -2795,63 +2821,7 @@ func TestSyncCleanSuccess(t *testing.T) {
 			}
 		}
 	}
-	checkBlockCache(t, config, id, nil, nil)
-}
-
-func expectSyncDirtyBlock(config *ConfigMock, kmd KeyMetadata,
-	p path, ptr BlockPointer, block *FileBlock, splitAt int64,
-	padSize int, opsLockHeld bool) *gomock.Call {
-	branch := MasterBranch
-	if config.mockDirtyBcache != nil {
-		config.mockDirtyBcache.EXPECT().IsDirty(gomock.Any(), ptrMatcher{ptr},
-			branch).AnyTimes().Return(true)
-		config.mockDirtyBcache.EXPECT().Get(gomock.Any(), ptrMatcher{ptr},
-			branch).AnyTimes().Return(block, nil)
-	} else {
-		config.DirtyBlockCache().Put(p.Tlf, ptr, branch, block)
-	}
-	if !opsLockHeld {
-		makeBlockStateDirty(config, kmd, p, ptr)
-	}
-	c1 := config.mockBsplit.EXPECT().CheckSplit(block).Return(splitAt)
-
-	newID := kbfsblock.FakeIDAdd(ptr.ID, 100)
-	// Ideally, we'd use the size of block.Contents at the time
-	// that Ready() is called, but GoMock isn't expressive enough
-	// for that.
-	newEncBuf := make([]byte, len(block.Contents)+padSize)
-	readyBlockData := ReadyBlockData{
-		buf: newEncBuf,
-	}
-	c2 := config.mockBops.EXPECT().Ready(gomock.Any(), kmdMatcher{kmd}, block).
-		After(c1).Return(newID, len(block.Contents), readyBlockData, nil)
-
-	newPtr := BlockPointer{ID: newID}
-	if config.mockBcache != nil {
-		config.mockBcache.EXPECT().Put(ptrMatcher{newPtr}, kmd.TlfID(), block, PermanentEntry).Return(nil)
-		config.mockBcache.EXPECT().DeletePermanent(newID).Return(nil)
-	} else {
-		// Nothing to do, since the cache entry is added and
-		// removed.
-	}
-
-	config.mockBserv.EXPECT().Put(gomock.Any(), kmd.TlfID(), newID,
-		gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
-	return c2
-}
-
-func putAndCleanAnyBlock(config *ConfigMock, p path) {
-	config.mockBcache.EXPECT().Put(gomock.Any(), gomock.Any(), gomock.Any(), TransientEntry).
-		Do(func(ptr BlockPointer, tlf tlf.ID, block Block, lifetime BlockCacheLifetime) {
-			config.mockDirtyBcache.EXPECT().
-				Get(gomock.Any(), ptrMatcher{BlockPointer{ID: ptr.ID}},
-					p.Branch).AnyTimes().Return(nil, NoSuchBlockError{ptr.ID})
-			config.mockBcache.EXPECT().
-				Get(ptrMatcher{BlockPointer{ID: ptr.ID}}).
-				AnyTimes().Return(block, nil)
-		}).AnyTimes().Return(nil)
-	config.mockDirtyBcache.EXPECT().Delete(gomock.Any(), gomock.Any(),
-		p.Branch).AnyTimes().Return(nil)
+	checkBlockCache(t, ctx, config, id, nil, nil)
 }
 
 func TestKBFSOpsStatRootSuccess(t *testing.T) {
@@ -3170,9 +3140,11 @@ type corruptBlockServer struct {
 }
 
 func (cbs corruptBlockServer) Get(
-	ctx context.Context, tlfID tlf.ID, id kbfsblock.ID, context kbfsblock.Context) (
+	ctx context.Context, tlfID tlf.ID, id kbfsblock.ID,
+	context kbfsblock.Context, cacheType DiskBlockCacheType) (
 	[]byte, kbfscrypto.BlockCryptKeyServerHalf, error) {
-	data, keyServerHalf, err := cbs.BlockServer.Get(ctx, tlfID, id, context)
+	data, keyServerHalf, err := cbs.BlockServer.Get(
+		ctx, tlfID, id, context, cacheType)
 	if err != nil {
 		return nil, kbfscrypto.BlockCryptKeyServerHalf{}, err
 	}
@@ -3373,6 +3345,9 @@ func TestDirtyPathsAfterRemoveDir(t *testing.T) {
 	rootNode := GetRootNodeOrBust(ctx, t, config, "test_user", tlf.Private)
 	kbfsOps := config.KBFSOps()
 
+	// Don't let the prefetcher bring the block back into the cache.
+	config.BlockOps().Prefetcher().Shutdown()
+
 	// Create a/b/c.
 	nodeA, _, err := kbfsOps.CreateDir(ctx, rootNode, "a")
 	require.NoError(t, err)
@@ -3392,7 +3367,7 @@ func TestDirtyPathsAfterRemoveDir(t *testing.T) {
 	ops := getOps(config, rootNode.GetFolderBranch().Tlf)
 	ptrC := ops.nodeCache.PathFromNode(nodeC).tailPointer()
 	err = config.BlockCache().DeleteTransient(
-		ptrC, rootNode.GetFolderBranch().Tlf)
+		ptrC.ID, rootNode.GetFolderBranch().Tlf)
 	require.NoError(t, err)
 
 	// Remove c.
@@ -4067,27 +4042,45 @@ type bserverPutToDiskCache struct {
 
 func (b bserverPutToDiskCache) Get(
 	ctx context.Context, tlfID tlf.ID, id kbfsblock.ID,
-	context kbfsblock.Context) (
+	context kbfsblock.Context, cacheType DiskBlockCacheType) (
 	buf []byte, serverHalf kbfscrypto.BlockCryptKeyServerHalf, err error) {
-	buf, serverHalf, err = b.BlockServer.Get(ctx, tlfID, id, context)
+	buf, serverHalf, err = b.BlockServer.Get(
+		ctx, tlfID, id, context, cacheType)
 	if err != nil {
 		return buf, serverHalf, err
 	}
 
-	b.dbc.Put(ctx, tlfID, id, buf, serverHalf)
+	b.dbc.Put(ctx, tlfID, id, buf, serverHalf, cacheType)
 	return buf, serverHalf, nil
 }
 
-func (b bserverPutToDiskCache) Put(ctx context.Context, tlfID tlf.ID,
-	id kbfsblock.ID, context kbfsblock.Context, buf []byte,
-	serverHalf kbfscrypto.BlockCryptKeyServerHalf) (err error) {
-	err = b.BlockServer.Put(ctx, tlfID, id, context, buf, serverHalf)
+func (b bserverPutToDiskCache) Put(
+	ctx context.Context, tlfID tlf.ID, id kbfsblock.ID,
+	context kbfsblock.Context, buf []byte,
+	serverHalf kbfscrypto.BlockCryptKeyServerHalf,
+	cacheType DiskBlockCacheType) (err error) {
+	err = b.BlockServer.Put(ctx, tlfID, id, context, buf, serverHalf, cacheType)
 	if err != nil {
 		return err
 	}
 
-	b.dbc.Put(ctx, tlfID, id, buf, serverHalf)
+	b.dbc.Put(ctx, tlfID, id, buf, serverHalf, cacheType)
 	return nil
+}
+
+func enableDiskCacheForTest(
+	t *testing.T, config *ConfigLocal, tempdir string) *diskBlockCacheWrapped {
+	dbc, err := newDiskBlockCacheWrapped(config, "")
+	require.NoError(t, err)
+	config.diskBlockCache = dbc
+	err = dbc.workingSetCache.WaitUntilStarted()
+	require.NoError(t, err)
+	err = dbc.syncCache.WaitUntilStarted()
+	require.NoError(t, err)
+	err = config.EnableDiskLimiter(tempdir)
+	require.NoError(t, err)
+	config.loadSyncedTlfsLocked()
+	return dbc
 }
 
 func TestKBFSOpsSyncedMDCommit(t *testing.T) {
@@ -4104,16 +4097,7 @@ func TestKBFSOpsSyncedMDCommit(t *testing.T) {
 	dmc := newDiskMDCacheWithCommitChan(dmcLocal, commitCh)
 	config.diskMDCache = dmc
 
-	dbc, err := newDiskBlockCacheWrapped(config, "")
-	require.NoError(t, err)
-	config.diskBlockCache = dbc
-	err = dbc.workingSetCache.WaitUntilStarted()
-	require.NoError(t, err)
-	err = dbc.syncCache.WaitUntilStarted()
-	require.NoError(t, err)
-	err = config.EnableDiskLimiter(tempdir)
-	require.NoError(t, err)
-	config.loadSyncedTlfsLocked()
+	dbc := enableDiskCacheForTest(t, config, tempdir)
 
 	t.Log("Create a private, synced TLF")
 	config.SetBlockServer(bserverPutToDiskCache{config.BlockServer(), dbc})
@@ -4130,7 +4114,10 @@ func TestKBFSOpsSyncedMDCommit(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	config.SetTlfSyncState(rootNode.GetFolderBranch().Tlf, true)
+	config.SetTlfSyncState(
+		rootNode.GetFolderBranch().Tlf, FolderSyncConfig{
+			Mode: keybase1.FolderSyncMode_ENABLED,
+		})
 	_, _, err = kbfsOps.CreateDir(ctx, rootNode, "a")
 	require.NoError(t, err)
 	err = kbfsOps.SyncAll(ctx, rootNode.GetFolderBranch())
@@ -4213,4 +4200,337 @@ func TestKBFSOpsSyncedMDCommit(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 	staller.UnstallOneBlockOp(StallableBlockGet)
+}
+
+func TestKBFSOpsPartialSyncConfig(t *testing.T) {
+	var u1 kbname.NormalizedUsername = "u1"
+	config, _, ctx, cancel := kbfsOpsConcurInit(t, u1)
+	defer kbfsConcurTestShutdown(t, config, ctx, cancel)
+
+	name := "u1"
+	h, err := ParseTlfHandle(
+		ctx, config.KBPKI(), config.MDOps(), string(name), tlf.Private)
+	require.NoError(t, err)
+	kbfsOps := config.KBFSOps()
+
+	tempdir, err := ioutil.TempDir(os.TempDir(), "disk_cache")
+	require.NoError(t, err)
+	defer ioutil.RemoveAll(tempdir)
+	_ = enableDiskCacheForTest(t, config, tempdir)
+
+	t.Log("Sync should start off as disabled.")
+	syncConfig, err := kbfsOps.GetSyncConfig(ctx, h.tlfID)
+	require.NoError(t, err)
+	require.Equal(t, keybase1.FolderSyncMode_DISABLED, syncConfig.Mode)
+
+	t.Log("Expect an error before the TLF is initialized")
+	syncConfig.Mode = keybase1.FolderSyncMode_PARTIAL
+	pathsMap := map[string]bool{
+		"a/b/c": true,
+		"d/e/f": true,
+	}
+	syncConfig.Paths = make([]string, 0, 2)
+	for p := range pathsMap {
+		syncConfig.Paths = append(syncConfig.Paths, p)
+	}
+	_, err = kbfsOps.SetSyncConfig(ctx, h.tlfID, syncConfig)
+	require.Error(t, err)
+
+	t.Log("Initialize the TLF")
+	rootNode, _, err := kbfsOps.GetOrCreateRootNode(ctx, h, MasterBranch)
+	require.NoError(t, err)
+	_, _, err = kbfsOps.CreateDir(ctx, rootNode, "a")
+	require.NoError(t, err)
+
+	t.Log("Set a partial sync config")
+	_, err = kbfsOps.SetSyncConfig(ctx, h.tlfID, syncConfig)
+	require.NoError(t, err)
+
+	t.Log("Make sure the lower-level config is encrypted")
+	lowLevelConfig := config.GetTlfSyncState(h.tlfID)
+	require.Equal(t, keybase1.FolderSyncMode_PARTIAL, lowLevelConfig.Mode)
+	require.NotEqual(t, zeroPtr, lowLevelConfig.Paths.Ptr)
+	var zeroBytes [32]byte
+	require.False(t,
+		bytes.Equal(zeroBytes[:], lowLevelConfig.Paths.ServerHalf.Bytes()))
+
+	t.Log("Read it back out unencrypted")
+	config.ResetCaches()
+	syncConfig, err = kbfsOps.GetSyncConfig(ctx, h.tlfID)
+	require.Equal(t, keybase1.FolderSyncMode_PARTIAL, syncConfig.Mode)
+	require.Len(t, syncConfig.Paths, len(pathsMap))
+	for _, p := range syncConfig.Paths {
+		require.True(t, pathsMap[p])
+		delete(pathsMap, p)
+	}
+
+	t.Log("Test some failure scenarios")
+	syncConfig.Paths = []string{"a/b/c", "a/b/c"}
+	_, err = kbfsOps.SetSyncConfig(ctx, h.tlfID, syncConfig)
+	require.Error(t, err)
+	syncConfig.Paths = []string{"/a/b/c", "d/e/f"}
+	_, err = kbfsOps.SetSyncConfig(ctx, h.tlfID, syncConfig)
+	require.Error(t, err)
+	syncConfig.Paths = []string{"a/../a/b/c", "a/b/c"}
+	_, err = kbfsOps.SetSyncConfig(ctx, h.tlfID, syncConfig)
+	require.Error(t, err)
+	syncConfig.Paths = []string{"a/../../a/b/c"}
+	_, err = kbfsOps.SetSyncConfig(ctx, h.tlfID, syncConfig)
+	require.Error(t, err)
+
+	t.Log("Make sure the paths are cleaned and ToSlash'd")
+	pathsMap = map[string]bool{
+		"a/b/c": true,
+		"d/e/f": true,
+	}
+	syncConfig.Paths = []string{"a/../a/b/c", filepath.Join("d", "e", "f")}
+	_, err = kbfsOps.SetSyncConfig(ctx, h.tlfID, syncConfig)
+	require.NoError(t, err)
+	syncConfig, err = kbfsOps.GetSyncConfig(ctx, h.tlfID)
+	require.Equal(t, keybase1.FolderSyncMode_PARTIAL, syncConfig.Mode)
+	require.Len(t, syncConfig.Paths, len(pathsMap))
+	for _, p := range syncConfig.Paths {
+		require.True(t, pathsMap[p])
+		delete(pathsMap, p)
+	}
+}
+
+func waitForPrefetchInTest(
+	t *testing.T, ctx context.Context, config Config, node Node) {
+	md, err := config.KBFSOps().GetNodeMetadata(ctx, node)
+	require.NoError(t, err)
+	ch, err := config.BlockOps().Prefetcher().WaitChannelForBlockPrefetch(
+		ctx, md.BlockInfo.BlockPointer)
+	require.NoError(t, err)
+	select {
+	case <-ch:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+func TestKBFSOpsPartialSync(t *testing.T) {
+	var u1 kbname.NormalizedUsername = "u1"
+	config, _, ctx, cancel := kbfsOpsConcurInit(t, u1)
+	defer kbfsConcurTestShutdown(t, config, ctx, cancel)
+
+	name := "u1"
+	h, err := ParseTlfHandle(
+		ctx, config.KBPKI(), config.MDOps(), string(name), tlf.Private)
+	require.NoError(t, err)
+	kbfsOps := config.KBFSOps()
+
+	tempdir, err := ioutil.TempDir(os.TempDir(), "disk_cache")
+	require.NoError(t, err)
+	defer ioutil.RemoveAll(tempdir)
+	dbc := enableDiskCacheForTest(t, config, tempdir)
+
+	// config2 is the writer.
+	config2 := ConfigAsUser(config, u1)
+	defer CheckConfigAndShutdown(ctx, t, config2)
+	kbfsOps2 := config2.KBFSOps()
+	// Turn the directories into indirect blocks when they have more
+	// than one entry, to make sure we sync the entire parent
+	// directories on partial paths.
+	config2.BlockSplitter().(*BlockSplitterSimple).maxDirEntriesPerBlock = 1
+
+	t.Log("Initialize the TLF")
+	rootNode2, _, err := kbfsOps2.GetOrCreateRootNode(ctx, h, MasterBranch)
+	require.NoError(t, err)
+	aNode, _, err := kbfsOps2.CreateDir(ctx, rootNode2, "a")
+	require.NoError(t, err)
+	err = kbfsOps2.SyncAll(ctx, rootNode2.GetFolderBranch())
+	require.NoError(t, err)
+
+	t.Log("Set the sync config on first device")
+	config.SetBlockServer(bserverPutToDiskCache{config.BlockServer(), dbc})
+	rootNode, _, err := kbfsOps.GetOrCreateRootNode(ctx, h, MasterBranch)
+	require.NoError(t, err)
+	syncConfig := keybase1.FolderSyncConfig{
+		Mode:  keybase1.FolderSyncMode_PARTIAL,
+		Paths: []string{"a/b/c"},
+	}
+	_, err = kbfsOps.SetSyncConfig(ctx, h.tlfID, syncConfig)
+	require.NoError(t, err)
+	err = kbfsOps.SyncFromServer(ctx, rootNode.GetFolderBranch(), nil)
+	require.NoError(t, err)
+
+	t.Log("Root block and 'a' block should be synced")
+	checkSyncCache := func(expectedBlocks uint64) {
+		waitForPrefetchInTest(t, ctx, config, rootNode)
+		waitForPrefetchInTest(t, ctx, config, aNode)
+		syncStatusMap := dbc.syncCache.Status(ctx)
+		require.Len(t, syncStatusMap, 1)
+		syncStatus, ok := syncStatusMap[syncCacheName]
+		require.True(t, ok)
+		require.Equal(t, expectedBlocks, syncStatus.NumBlocks)
+	}
+	checkSyncCache(2)
+
+	t.Log("First device completes synced path, along with others")
+	bNode, _, err := kbfsOps2.CreateDir(ctx, aNode, "b")
+	require.NoError(t, err)
+	b2Node, _, err := kbfsOps2.CreateDir(ctx, aNode, "b2")
+	require.NoError(t, err)
+	cNode, _, err := kbfsOps2.CreateDir(ctx, bNode, "c")
+	require.NoError(t, err)
+	_, _, err = kbfsOps2.CreateDir(ctx, b2Node, "c2")
+	require.NoError(t, err)
+	dNode, _, err := kbfsOps2.CreateDir(ctx, rootNode2, "d")
+	require.NoError(t, err)
+	err = kbfsOps2.SyncAll(ctx, rootNode2.GetFolderBranch())
+	require.NoError(t, err)
+
+	t.Log("Blocks 'b' and 'c' should be synced, nothing else")
+	err = kbfsOps.SyncFromServer(ctx, rootNode.GetFolderBranch(), nil)
+	require.NoError(t, err)
+
+	// 8 blocks: root node (1 indirect, 2 direct), `a` node (1
+	// indirect, 2 direct), `b` node, `c` node (and the old archived
+	// ones have been GC'd from the sync cache).
+	checkSyncCache(8)
+
+	checkStatus := func(node Node, expectedStatus PrefetchStatus) {
+		md, err := kbfsOps.GetNodeMetadata(ctx, node)
+		require.NoError(t, err)
+		require.Equal(t, expectedStatus, md.PrefetchStatus)
+	}
+	// Note that we're deliberately passing in Nodes created by
+	// kbfsOps2 into kbfsOps here.  That's necessary to avoid
+	// prefetching on the normal path by kbfsOps on the lookups it
+	// would take to make those nodes.
+	checkStatus(cNode, FinishedPrefetch)
+
+	t.Log("Add more data under prefetched path")
+	eNode, _, err := kbfsOps2.CreateDir(ctx, cNode, "e")
+	require.NoError(t, err)
+	fNode, _, err := kbfsOps2.CreateFile(ctx, eNode, "f", false, NoExcl)
+	require.NoError(t, err)
+	err = kbfsOps2.Write(ctx, fNode, []byte("fdata"), 0)
+	require.NoError(t, err)
+	err = kbfsOps2.SyncAll(ctx, rootNode2.GetFolderBranch())
+	require.NoError(t, err)
+
+	t.Log("Check that two new blocks are synced")
+	err = kbfsOps.SyncFromServer(ctx, rootNode.GetFolderBranch(), nil)
+	require.NoError(t, err)
+
+	checkSyncCache(10)
+	checkStatus(cNode, FinishedPrefetch)
+	checkStatus(eNode, FinishedPrefetch)
+	checkStatus(fNode, FinishedPrefetch)
+
+	t.Log("Add something that's not synced")
+	gNode, _, err := kbfsOps2.CreateDir(ctx, dNode, "g")
+	require.NoError(t, err)
+	err = kbfsOps2.SyncAll(ctx, rootNode2.GetFolderBranch())
+	require.NoError(t, err)
+
+	t.Log("Check that the updated root block is synced, but nothing new")
+	err = kbfsOps.SyncFromServer(ctx, rootNode.GetFolderBranch(), nil)
+	require.NoError(t, err)
+
+	checkSyncCache(10)
+	checkStatus(cNode, FinishedPrefetch)
+	checkStatus(eNode, FinishedPrefetch)
+	checkStatus(fNode, FinishedPrefetch)
+
+	t.Log("Sync the new path")
+	syncConfig.Paths = append(syncConfig.Paths, "d")
+	_, err = kbfsOps.SetSyncConfig(ctx, h.tlfID, syncConfig)
+	require.NoError(t, err)
+	err = kbfsOps.SyncFromServer(ctx, rootNode.GetFolderBranch(), nil)
+	require.NoError(t, err)
+
+	checkSyncCache(12)
+	checkStatus(cNode, FinishedPrefetch)
+	checkStatus(eNode, FinishedPrefetch)
+	checkStatus(fNode, FinishedPrefetch)
+	checkStatus(dNode, FinishedPrefetch)
+	checkStatus(gNode, FinishedPrefetch)
+}
+
+func TestKBFSOpsRecentHistorySync(t *testing.T) {
+	var u1 kbname.NormalizedUsername = "u1"
+	config, _, ctx, cancel := kbfsOpsConcurInit(t, u1)
+	defer kbfsConcurTestShutdown(t, config, ctx, cancel)
+	// kbfsOpsConcurInit turns off notifications, so turn them back on.
+	config.mode = modeTest{NewInitModeFromType(InitDefault)}
+
+	name := "u1"
+	h, err := ParseTlfHandle(
+		ctx, config.KBPKI(), config.MDOps(), string(name), tlf.Private)
+	require.NoError(t, err)
+	kbfsOps := config.KBFSOps()
+
+	tempdir, err := ioutil.TempDir(os.TempDir(), "disk_cache")
+	require.NoError(t, err)
+	defer ioutil.RemoveAll(tempdir)
+	dbc := enableDiskCacheForTest(t, config, tempdir)
+
+	// config2 is the writer.
+	config2 := ConfigAsUser(config, u1)
+	defer CheckConfigAndShutdown(ctx, t, config2)
+	config2.mode = modeTest{NewInitModeFromType(InitDefault)}
+	kbfsOps2 := config2.KBFSOps()
+
+	config.SetBlockServer(bserverPutToDiskCache{config.BlockServer(), dbc})
+
+	t.Log("Initialize the TLF")
+	rootNode2, _, err := kbfsOps2.GetOrCreateRootNode(ctx, h, MasterBranch)
+	require.NoError(t, err)
+	aNode, _, err := kbfsOps2.CreateDir(ctx, rootNode2, "a")
+	require.NoError(t, err)
+	err = kbfsOps2.SyncAll(ctx, rootNode2.GetFolderBranch())
+	require.NoError(t, err)
+
+	t.Log("No files were edited, but fetching the root block will prefetch a")
+	rootNode, _, err := kbfsOps.GetOrCreateRootNode(ctx, h, MasterBranch)
+	require.NoError(t, err)
+	err = kbfsOps.SyncFromServer(ctx, rootNode.GetFolderBranch(), nil)
+	require.NoError(t, err)
+
+	checkWorkingSetCache := func(expectedBlocks uint64) {
+		waitForPrefetchInTest(t, ctx, config, rootNode)
+		waitForPrefetchInTest(t, ctx, config, aNode)
+
+		statusMap := dbc.workingSetCache.Status(ctx)
+		require.Len(t, statusMap, 1)
+		status, ok := statusMap[workingSetCacheName]
+		require.True(t, ok)
+		require.Equal(t, expectedBlocks, status.NumBlocks)
+	}
+	checkWorkingSetCache(2)
+
+	checkStatus := func(node Node, expectedStatus PrefetchStatus) {
+		md, err := kbfsOps.GetNodeMetadata(ctx, node)
+		require.NoError(t, err)
+		require.Equal(t, expectedStatus, md.PrefetchStatus)
+	}
+	checkStatus(rootNode, FinishedPrefetch)
+	checkStatus(aNode, FinishedPrefetch)
+
+	t.Log("Writer adds a file, which gets prefetched")
+	// Disable updates for the reader until after the edit
+	// notification is sent and delivered.  This reflects a real issue
+	// in production where the MD update can be delivered and
+	// processed before the edit notification, and thus the new
+	// activity wouldn't be properly prefetched.  TODO(KBFS-3698): fix
+	// this in production and remove this disabling.
+	c, err := DisableUpdatesForTesting(config, rootNode.GetFolderBranch())
+	require.NoError(t, err)
+	bNode, _, err := kbfsOps2.CreateFile(ctx, aNode, "b", false, NoExcl)
+	require.NoError(t, err)
+	err = kbfsOps2.Write(ctx, bNode, []byte("bdata"), 0)
+	require.NoError(t, err)
+	err = kbfsOps2.SyncAll(ctx, rootNode2.GetFolderBranch())
+	require.NoError(t, err)
+	err = kbfsOps2.SyncFromServer(ctx, rootNode.GetFolderBranch(), nil)
+	require.NoError(t, err)
+	c <- struct{}{}
+
+	err = kbfsOps.SyncFromServer(ctx, rootNode.GetFolderBranch(), nil)
+	require.NoError(t, err)
+	checkWorkingSetCache(3)
+	checkStatus(bNode, FinishedPrefetch)
 }

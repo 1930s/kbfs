@@ -94,6 +94,10 @@ func (tb TestBlock) NewEmpty() Block {
 	return &TestBlock{}
 }
 
+func (tb TestBlock) NewEmptier() func() Block {
+	return tb.NewEmpty
+}
+
 func (tb *TestBlock) Set(other Block) {
 	otherTb := other.(*TestBlock)
 	tb.A = otherTb.A
@@ -105,6 +109,10 @@ func (tb *TestBlock) ToCommonBlock() *CommonBlock {
 
 func (tb *TestBlock) IsIndirect() bool {
 	return false
+}
+
+func (tb *TestBlock) IsTail() bool {
+	return true
 }
 
 func (tb TestBlock) OffsetExceedsData(_, _ Offset) bool {
@@ -392,6 +400,10 @@ func (tba testBlockArray) NewEmpty() Block {
 	return &testBlockArray{}
 }
 
+func (tba testBlockArray) NewEmptier() func() Block {
+	return tba.NewEmpty
+}
+
 func (tba testBlockArray) ToCommonBlock() *CommonBlock {
 	return nil
 }
@@ -403,6 +415,10 @@ func (tba *testBlockArray) Set(other Block) {
 
 func (tba testBlockArray) IsIndirect() bool {
 	return false
+}
+
+func (tba *testBlockArray) IsTail() bool {
+	return true
 }
 
 func (tba testBlockArray) OffsetExceedsData(_, _ Offset) bool {
